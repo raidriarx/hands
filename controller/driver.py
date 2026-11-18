@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -113,6 +114,7 @@ def _focus_window_by_title(
     title_substring: str,
     target_pid: Optional[int] = None,
     retries: int = 5,
+    maximize: bool = False,
 ) -> tuple[Optional[tuple[int, int, int, int]], bool]:
     """Focus a visible Win32 window matching target_pid/title_substring and confirm foreground."""
     if os.name != "nt" or not title_substring.strip():
@@ -171,7 +173,7 @@ def _focus_window_by_title(
         hwnd, bounds = chosen
         last_bounds = bounds
         try:
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.ShowWindow(hwnd, 3 if maximize else 9)  # SW_MAXIMIZE or SW_RESTORE
             user32.SetForegroundWindow(hwnd)
             fg_hwnd = user32.GetForegroundWindow()
             if fg_hwnd != hwnd:
@@ -248,6 +250,131 @@ def _list_visible_window_titles() -> list[str]:
 
     user32.EnumWindows(enum_proc_type(_callback), 0)
     return titles
+
+
+class _Win32Rect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+def get_foreground_window_rect() -> Optional[tuple[int, int, int, int]]:
+    """Return (left, top, right, bottom) of the active foreground window on Windows."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        rect = _Win32Rect()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:
+        return None
+
+
+_COMMON_WINDOWS_APP_PATHS: dict[str, tuple[str, ...]] = {
+    "firefox": (
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+    ),
+    "msedge": (
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ),
+    "edge": (
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ),
+    "chrome": (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ),
+    "google chrome": (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ),
+    "brave": (
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ),
+    "calc": (r"C:\Windows\System32\calc.exe",),
+    "calculator": (r"C:\Windows\System32\calc.exe",),
+}
+
+
+def _resolve_app_executable(app_name: str) -> str:
+    """Resolve bare Windows app names (e.g. firefox, msedge, chrome) to an executable path."""
+    raw = app_name.strip()
+    if not raw or "/" in raw or "\\" in raw or ":" in raw:
+        return app_name
+
+    if shutil.which(raw) is not None:
+        return app_name
+
+    lower = raw.lower()
+    stem = Path(lower).stem
+
+    candidates: list[str] = list(_COMMON_WINDOWS_APP_PATHS.get(lower, ()))
+    if stem != lower:
+        candidates.extend(_COMMON_WINDOWS_APP_PATHS.get(stem, ()))
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        if lower in {"chrome", "google chrome"}:
+            candidates.append(str(Path(local_app_data) / "Google" / "Chrome" / "Application" / "chrome.exe"))
+        elif lower == "brave":
+            candidates.append(str(Path(local_app_data) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"))
+        elif lower == "firefox":
+            candidates.append(str(Path(local_app_data) / "Mozilla Firefox" / "firefox.exe"))
+        elif lower in {"msedge", "edge"}:
+            candidates.append(str(Path(local_app_data) / "Microsoft" / "Edge" / "Application" / "msedge.exe"))
+
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+
+    if os.name == "nt":
+        try:
+            import winreg
+
+            exe_name = f"{stem}.exe" if not stem.endswith(".exe") else stem
+            subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        val, _ = winreg.QueryValueEx(key, "")
+                        cleaned = str(val).strip().strip('"')
+                        if cleaned and Path(cleaned).is_file():
+                            return cleaned
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+    return app_name
+
+
+def cleanup_notepads_for_fresh_demo() -> None:
+    """Terminate lingering Notepad processes before a fresh live Milestone 4 demo run."""
+    if os.name != "nt" or os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "notepad.exe"],
+            capture_output=True,
+            check=False,
+        )
+        time.sleep(0.3)
+    except Exception:
+        pass
 
 
 class BaseDesktopDriver(ABC):
@@ -327,6 +454,10 @@ class BaseDesktopDriver(ABC):
         expected_text: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Verify file existence/content or active window text."""
+
+    def restore_last_app_focus(self) -> bool:
+        """Re-focus the most recently launched application window if available."""
+        return True
 
 
 class MockDryRunDriver(BaseDesktopDriver):
@@ -428,6 +559,8 @@ class MockDryRunDriver(BaseDesktopDriver):
                 "double": double,
             }
         )
+        if "music.youtube.com" in self.active_window_text or "music.youtube.com" in "".join(self.typed_texts):
+            self.active_window_text = "Lofi Beats - YouTube Music — Mozilla Firefox"
 
     def type_text(self, text: str, interval: float = 0.02) -> None:
         sw, sh = self.screen_size
@@ -525,6 +658,8 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         pyautogui.PAUSE = 0.0
         self._pyautogui = pyautogui
         self._suppress_esc_pause: bool = False
+        self._last_launched_stem: Optional[str] = None
+        self._last_launched_pid: Optional[int] = None
 
     def _poll_global_hotkeys(self) -> None:
         if os.name != "nt":
@@ -657,6 +792,19 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         finally:
             if sends_esc:
                 self._suppress_esc_pause = False
+        is_save_chord = (
+            normalized in (["ctrl", "s"], ["control", "s"])
+            and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
+        )
+        if is_save_chord:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                self._poll_hotkeys_and_safety()
+                fg_title = (_get_foreground_window_title() or "").lower()
+                if "save" in fg_title:
+                    time.sleep(0.15)
+                    break
+                time.sleep(0.05)
         if self.speed_config.post_action_delay_sec > 0:
             self._poll_hotkeys_and_safety()
             time.sleep(self.speed_config.post_action_delay_sec)
@@ -687,13 +835,32 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         args: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         self._poll_hotkeys_and_safety()
-        cmd = [app_name, *(args or [])]
+        resolved_exe = _resolve_app_executable(app_name)
+        cmd = [resolved_exe, *(args or [])]
         proc = subprocess.Popen(cmd, shell=False)
         time.sleep(0.5)
-        stem = Path(app_name).stem
-        rect, focus_confirmed = _focus_window_by_title(stem, target_pid=proc.pid)
+        stem = Path(resolved_exe).stem or Path(app_name).stem
+        self._last_launched_stem = stem
+        self._last_launched_pid = proc.pid
+        should_maximize = stem.lower() in {"firefox", "chrome", "msedge", "edge", "brave"}
+        if should_maximize:
+            rect, focus_confirmed = _focus_window_by_title(
+                stem,
+                target_pid=proc.pid,
+                maximize=True,
+            )
+            if not focus_confirmed and stem.lower() == "msedge":
+                rect, focus_confirmed = _focus_window_by_title(
+                    "edge",
+                    target_pid=proc.pid,
+                    maximize=True,
+                )
+        else:
+            rect, focus_confirmed = _focus_window_by_title(stem, target_pid=proc.pid)
         if rect is None:
             rect = find_window_rect(stem)
+            if rect is None and stem.lower() == "msedge":
+                rect = find_window_rect("edge")
         return {
             "app_name": app_name,
             "args": list(args or []),
@@ -702,6 +869,16 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             "focus_confirmed": focus_confirmed,
             "mock": False,
         }
+
+    def restore_last_app_focus(self) -> bool:
+        """Re-focus the most recently launched application window if available."""
+        if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1" or not self._last_launched_stem:
+            return False
+        _rect, focus_confirmed = _focus_window_by_title(
+            self._last_launched_stem,
+            target_pid=self._last_launched_pid,
+        )
+        return bool(focus_confirmed)
 
     def verify_state(
         self,
@@ -719,6 +896,28 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             return True, f"Verified file on disk: {target_path}"
 
         if expected_text:
+            if expected_text.strip().lower() == "- youtube music":
+                attempts = 1 if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1" else 6
+                saw_yt_music = False
+                for attempt in range(attempts):
+                    candidates: list[str] = []
+                    fg_title = _get_foreground_window_title()
+                    if fg_title:
+                        candidates.append(fg_title)
+                    candidates.extend(_list_visible_window_titles())
+                    for title in candidates:
+                        lower_title = title.lower()
+                        idx = lower_title.find("- youtube music")
+                        if idx > 0 and lower_title[:idx].strip():
+                            return True, f"Verified active YouTube Music playback in window: {title}"
+                        if "youtube music" in lower_title:
+                            saw_yt_music = True
+                    if attempt + 1 < attempts:
+                        time.sleep(0.25)
+                if saw_yt_music:
+                    return False, "YouTube Music is open, but no active song playback was detected in the window title"
+                return False, f"No visible window title matched {expected_text!r}"
+
             fg_title = _get_foreground_window_title()
             if fg_title and expected_text.lower() in fg_title.lower():
                 return True, f"Verified active foreground window title containing {expected_text!r}"

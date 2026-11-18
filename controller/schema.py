@@ -58,6 +58,7 @@ class DesktopAction(BaseModel):
     description: str
     x: Optional[int] = None
     y: Optional[int] = None
+    mark_id: Optional[int] = None
     text: Optional[str] = None
     keys: Optional[list[str]] = None
     clicks: Optional[int] = None
@@ -101,8 +102,10 @@ class DesktopAction(BaseModel):
 
         at = self.action_type
         if at in (ActionType.click, ActionType.double_click, ActionType.move):
-            if self.x is None or self.y is None:
-                raise ValueError(f"{at.value} requires non-negative x and y coordinates")
+            has_coords = self.x is not None and self.y is not None
+            has_mark = self.mark_id is not None and self.mark_id >= 1
+            if not (has_coords or has_mark):
+                raise ValueError(f"{at.value} requires non-negative x and y coordinates or mark_id >= 1")
         elif at == ActionType.type_text:
             if self.text is None or len(self.text) == 0:
                 raise ValueError("type_text requires a non-empty text string")

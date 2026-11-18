@@ -10,23 +10,37 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import ValidationError
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLineEdit
 
 import controller.driver as driver_mod
 from controller.driver import (
     LiveWindowsDesktopDriver,
     MockDryRunDriver,
+    _resolve_app_executable,
     reconcile_dpi_coordinates,
 )
 from controller.emergency import SafetyController, SafetyGateError, EmergencyStopError
 from controller.engine import DesktopExecutionEngine
-from controller.gui import DesktopControllerWindow
-from controller.planners import BasePlanner, ObservationContext
+from controller.gui import BotCharacterOverlay, BotFaceWidget, DesktopControllerWindow
+from controller.planners import (
+    BasePlanner,
+    LocalDemoFallbackPlanner,
+    ObservationContext,
+    _extract_song_query,
+    _is_youtube_music_task,
+    annotate_screenshot_for_planner,
+    compute_screenshot_change_ratio,
+    create_foveated_screenshot,
+    extract_som_marks,
+    locate_youtube_music_play_button,
+    save_api_key_to_dotenv,
+    scale_normalized_coord,
+)
 from controller.policy import PolicyEngine
 from controller.schema import ActionType, DesktopAction, SpeedConfig, SpeedPreset
-from controller.store import SQLiteAuditStore
+from controller.store import SQLiteAuditStore, redact_secrets
 
 
 class TestSchemaAuditBoundsAndNonFinite:
@@ -623,3 +637,382 @@ class TestEscapePauseAndMidMoveYield:
         assert seen_suppress == [True]
         assert driver._suppress_esc_pause is False
         assert safety.paused is False
+
+
+class TestBrowserControlAndApiKeyUX:
+    """Verify Windows app path resolution, browser/YouTube Music fallback, and API key UX."""
+
+    def test_resolve_app_executable_for_notepad_and_firefox(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        firefox_path = r"C:\Program Files\Mozilla Firefox\firefox.exe"
+
+        monkeypatch.setattr(
+            driver_mod.shutil,
+            "which",
+            lambda name: r"C:\Windows\system32\notepad.exe" if name == "notepad" else None,
+        )
+        assert _resolve_app_executable("notepad") == "notepad"
+
+        orig_is_file = Path.is_file
+
+        def _fake_is_file(self: Path) -> bool:
+            if str(self) == firefox_path:
+                return True
+            return orig_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", _fake_is_file)
+        assert _resolve_app_executable("firefox") == firefox_path
+        assert _resolve_app_executable(r"C:\custom\app.exe") == r"C:\custom\app.exe"
+
+    def test_local_demo_planner_runs_firefox_youtube_music_end_to_end(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        store = SQLiteAuditStore(tmp_path / "browser_demo.db")
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=LocalDemoFallbackPlanner(),
+        )
+
+        res = engine.run_task("open firefox open youtube music and put on a song")
+        assert res.status == "completed"
+        assert res.steps_executed == 10
+        assert "firefox" in driver.launched_apps
+        assert ["ctrl", "l"] in driver.pressed_keys
+        assert ["enter"] in driver.pressed_keys
+        assert any("https://music.youtube.com/search?q=" in txt for txt in driver.typed_texts)
+        assert any(entry.get("action") == "click" for entry in driver.action_history)
+        actions = store.get_actions_for_run(res.run_id)
+        assert any(row["action_type"] == "verify_state" and row["status"] == "ok" for row in actions)
+        assert all(row["policy_decision"] == "allowed" for row in actions)
+
+    def test_window_b_api_key_input_switches_backend_and_updates_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        app = QApplication.instance() or QApplication([])
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+
+        assert hasattr(win, "api_key_input")
+        assert win.api_key_input.echoMode() == QLineEdit.EchoMode.Password
+        assert win.preset_task_combo.findText("Open Firefox, open YouTube Music, and put on a song") >= 0
+        assert win.backend_combo.currentText() == "Local Demo / Fallback"
+
+        win.api_key_input.setText("AIzaFakeTestKey123456")
+        assert win.backend_combo.currentText() == "Gemini API"
+        assert "Configured" in win.backend_status_label.text()
+
+        win.backend_combo.setCurrentText("Local Demo / Fallback")
+        win.api_key_input.setText("sk-FakeOpenAIKey123456")
+        assert win.backend_combo.currentText() == "OpenAI API"
+        assert "Configured" in win.backend_status_label.text()
+
+        win.api_key_input.setText("")
+        assert "Missing" in win.backend_status_label.text()
+
+        win.close()
+        app.processEvents()
+
+    def test_save_api_key_to_dotenv_and_backend_switching_preserves_keys(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        env_file = tmp_path / ".env"
+        assert save_api_key_to_dotenv("Gemini API", "AIzaSavedGeminiKey12345", env_path=env_file) == "GEMINI_API_KEY"
+        assert save_api_key_to_dotenv("OpenAI API", "sk-SavedOpenAIKey12345", env_path=env_file) == "OPENAI_API_KEY"
+        env_text = env_file.read_text(encoding="utf-8")
+        assert "GEMINI_API_KEY=AIzaSavedGeminiKey12345" in env_text
+        assert "OPENAI_API_KEY=sk-SavedOpenAIKey12345" in env_text
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        app = QApplication.instance() or QApplication([])
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+
+        assert hasattr(win, "save_key_button")
+        win.api_key_input.setText("AIzaGuiSavedKey99999")
+        win.save_key_button.click()
+        assert win.backend_combo.currentText() == "Gemini API"
+        assert "Configured" in win.backend_status_label.text()
+
+        win.backend_combo.setCurrentText("Local Demo / Fallback")
+        assert win.backend_status_label.text() == "Ready (Local Demo)"
+        assert win.api_key_input.text() == ""
+
+        win.backend_combo.setCurrentText("OpenAI API")
+        assert "Missing" in win.backend_status_label.text()
+        win.api_key_input.setText("sk-GuiSavedKey88888")
+        win.save_key_button.click()
+        assert "Configured" in win.backend_status_label.text()
+
+        # Switching back recalls each backend's saved key cleanly
+        win.backend_combo.setCurrentText("Gemini API")
+        assert win.api_key_input.text() == "AIzaGuiSavedKey99999"
+        assert "Configured" in win.backend_status_label.text()
+
+        win.backend_combo.setCurrentText("OpenAI API")
+        assert win.api_key_input.text() == "sk-GuiSavedKey88888"
+        assert "Configured" in win.backend_status_label.text()
+
+        # Verify AQ. Gemini Express keys auto-select Gemini API, save as GEMINI_API_KEY, and redact cleanly
+        win.backend_combo.setCurrentText("Local Demo / Fallback")
+        aq_key = "AQ.FakeVertexExpressKey12345"
+        win.api_key_input.setText(aq_key)
+        assert win.backend_combo.currentText() == "Gemini API"
+        assert save_api_key_to_dotenv("Local Demo / Fallback", aq_key, env_path=env_file) == "GEMINI_API_KEY"
+        assert f"GEMINI_API_KEY={aq_key}" in env_file.read_text(encoding="utf-8")
+        assert aq_key not in redact_secrets(f"Error with {aq_key}")
+
+        win.close()
+        app.processEvents()
+
+    def test_locate_youtube_music_play_button_detects_white_pill(self) -> None:
+        img = Image.new("RGB", (1920, 1080), (10, 10, 10))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([420, 460, 500, 496], fill=(250, 250, 250))
+
+        px, py = locate_youtube_music_play_button(
+            img,
+            active_window_rect=(0, 0, 1920, 1080),
+            screen_size=(1920, 1080),
+        )
+        assert (px, py) == (460, 478)
+
+    def test_youtube_music_task_fails_when_playback_verification_does_not_match(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _NoPlaybackDriver(MockDryRunDriver):
+            def verify_state(
+                self,
+                target_path: Optional[str] = None,
+                expected_text: Optional[str] = None,
+            ) -> tuple[bool, str]:
+                if expected_text and expected_text.strip().lower() == "- youtube music":
+                    return False, "YouTube Music is open, but no active song playback was detected in the window title"
+                return super().verify_state(target_path=target_path, expected_text=expected_text)
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = _NoPlaybackDriver(safety=safety)
+        store = SQLiteAuditStore(tmp_path / "failed_playback.db")
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=LocalDemoFallbackPlanner(),
+            max_retries=2,
+        )
+
+        res = engine.run_task("Open Firefox, open YouTube Music, and put on a song")
+        assert res.status == "failed"
+        assert res.retries_used == 2
+        assert "no active song playback" in (res.error or "").lower()
+
+    def test_bot_character_face_and_overlay_state_transitions(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        app = QApplication.instance() or QApplication([])
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+
+        assert isinstance(win.bot_avatar, BotFaceWidget)
+        assert isinstance(win.character_overlay, BotCharacterOverlay)
+        assert win.bot_avatar.mood == "idle"
+        assert win.character_overlay.current_mood == "idle"
+
+        win.start_button.click()
+        assert win.bot_avatar.mood == "working"
+        assert win.character_overlay.current_mood == "working"
+
+        win.set_progress(4, 10, "Clicking Play on YouTube Music")
+        assert "[4/10]" in win.character_overlay.status_text
+        win.bot_avatar.grab()
+        win.character_overlay._on_anim_tick()
+
+        win.pause_button.click()
+        assert win.bot_avatar.mood == "paused"
+        assert win.character_overlay.current_mood == "paused"
+
+        win.resume_button.click()
+        assert win.bot_avatar.mood == "working"
+        assert win.character_overlay.current_mood == "working"
+
+        win.emergency_stop_button.click()
+        assert win.bot_avatar.mood == "stopped"
+        assert win.character_overlay.current_mood == "stopped"
+
+        win.close()
+        app.processEvents()
+
+    def test_annotate_screenshot_and_compute_change_ratio(self) -> None:
+        base = Image.new("RGB", (640, 360), (20, 24, 32))
+        annotated = annotate_screenshot_for_planner(base, (460, 107), (1920, 1080))
+        assert annotated is not None
+        assert annotated.size == base.size
+        assert compute_screenshot_change_ratio(base, base) == pytest.approx(0.0)
+        assert compute_screenshot_change_ratio(base, annotated) > 0.0
+
+        changed = base.copy()
+        draw = ImageDraw.Draw(changed)
+        draw.rectangle([100, 100, 350, 260], fill=(240, 240, 240))
+        assert compute_screenshot_change_ratio(base, changed) > 0.01
+
+    def test_extract_song_query_for_juice_wrld_and_turn_on_song_prompts(self) -> None:
+        prompt1 = "open firefox and turn on a juice wrld song"
+        prompt2 = "open firefox and open youtube music and start playing juice wrld"
+        assert _is_youtube_music_task(prompt1.lower()) is True
+        assert _is_youtube_music_task(prompt2.lower()) is True
+        assert _extract_song_query(prompt1).lower() == "juice wrld"
+        assert _extract_song_query(prompt2).lower() == "juice wrld"
+
+    def test_ai_planner_self_corrects_when_repeating_same_click_cycle(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _RepeatingClickPlanner(BasePlanner):
+            name = "RepeatingClickPlanner"
+
+            def __init__(self) -> None:
+                self.seen_errors: list[Optional[str]] = []
+
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_errors.append(obs.last_error)
+                if obs.last_error and (
+                    "Loop detected" in obs.last_error or "Self-correction warning" in obs.last_error
+                ):
+                    return DesktopAction(
+                        action_type=ActionType.done,
+                        description="Self-corrected after loop detection",
+                    )
+                return DesktopAction(
+                    action_type=ActionType.click,
+                    x=460,
+                    y=107,
+                    description="Click search bar again",
+                )
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        store = SQLiteAuditStore(tmp_path / "loop_correct.db")
+        planner = _RepeatingClickPlanner()
+
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            max_retries=3,
+        )
+        res = engine.run_task("Click search bar in app")
+        assert res.status == "completed"
+        assert res.retries_used >= 1
+        assert any(err and "Loop detected" in err for err in planner.seen_errors)
+
+    def test_create_foveated_screenshot_preserves_full_screen_and_adds_zoom(self) -> None:
+        full = Image.new("RGB", (1920, 1080), (20, 24, 32))
+        draw = ImageDraw.Draw(full)
+        draw.rectangle([420, 460, 500, 496], fill=(250, 250, 250))
+
+        fov = create_foveated_screenshot(full, (460, 478), (1920, 1080))
+        assert fov is not None
+        assert fov.size == (960, 540)
+        # Zoom inset in bottom-right corner should contain bright pixels from the (420..500, 460..496) target
+        inset_center = fov.getpixel((960 - 8 - 160, 540 - 8 - 120))
+        assert inset_center[0] > 200 and inset_center[1] > 200 and inset_center[2] > 200
+
+    def test_som_marks_extraction_and_mark_id_click_resolution(self, tmp_path: Path) -> None:
+        img = Image.new("RGB", (1920, 1080), (15, 15, 15))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([800, 360, 920, 404], fill=(245, 245, 245))
+
+        marks = extract_som_marks(img, (1920, 1080))
+        assert 1 in marks
+        mx, my = marks[1]
+        assert 800 <= mx <= 920 and 360 <= my <= 404
+
+        class _MarkDriver(MockDryRunDriver):
+            def capture_screenshot(self) -> Image.Image:
+                return img
+
+        class _MarkPlanner(BasePlanner):
+            name = "MarkPlanner"
+
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                if obs.step_index == 0:
+                    return DesktopAction(
+                        action_type=ActionType.click,
+                        mark_id=1,
+                        description="Click mark [1]",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Done")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = _MarkDriver(safety=safety)
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=_MarkPlanner(),
+        )
+        res = engine.run_task("Click button")
+        assert res.status == "completed"
+        assert driver.get_cursor_position() == (mx, my)
+
+    def test_scale_normalized_coord_maps_1000_grid_to_screen(self) -> None:
+        assert scale_normalized_coord(0, 1920) == 0
+        assert scale_normalized_coord(500, 1920) == 960
+        assert scale_normalized_coord(1000, 1920) == 1919
+        assert scale_normalized_coord(1000, 1080) == 1079

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import socket
 import threading
@@ -10,8 +11,20 @@ from datetime import datetime
 from typing import Any, Optional
 
 from PIL import Image
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -45,6 +58,7 @@ from controller.emergency import (
     SafetyGateError,
     StopSource,
 )
+from controller.planners import get_saved_api_key_for_backend, save_api_key_to_dotenv
 from controller.schema import SpeedConfig, SpeedPreset
 
 MILESTONE_4_PRESET = (
@@ -53,6 +67,7 @@ MILESTONE_4_PRESET = (
 
 DEFAULT_TASK_PRESETS: tuple[str, ...] = (
     MILESTONE_4_PRESET,
+    "Open Firefox, open YouTube Music, and put on a song",
     "Open Notepad and summarize safety rules",
     "Verify approved workspace directory contents",
     "Custom Task",
@@ -64,6 +79,244 @@ BACKEND_OPTIONS: tuple[str, ...] = (
     "OpenAI API",
     "Local Ollama",
 )
+
+_MOOD_PALETTE: dict[str, tuple[str, str, str]] = {
+    "working": ("#38bdf8", "#fbbf24", "#0f172a"),
+    "completed": ("#4ade80", "#22c55e", "#052e16"),
+    "paused": ("#fb923c", "#f59e0b", "#451a03"),
+    "approval": ("#fb923c", "#f59e0b", "#451a03"),
+    "failed": ("#f87171", "#ef4444", "#450a0a"),
+    "stopped": ("#f87171", "#ef4444", "#450a0a"),
+    "idle": ("#94a3b8", "#60a5fa", "#1e293b"),
+}
+
+
+class BotFaceWidget(QWidget):
+    """Circular bot character face drawn with QPainter reflecting execution state."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.mood: str = "idle"
+        self.look_dx: float = 0.0
+        self.look_dy: float = 0.0
+        self._blink: bool = False
+        self._phase: float = 0.0
+        self.setMinimumSize(48, 48)
+
+    def set_state(
+        self,
+        mood: str,
+        look_dx: float = 0.0,
+        look_dy: float = 0.0,
+        blink: bool = False,
+        phase: float = 0.0,
+    ) -> None:
+        """Update mood, pupil look offset, blink state, and repaint."""
+        self.mood = mood if mood in _MOOD_PALETTE else "idle"
+        self.look_dx = max(-2.5, min(2.5, float(look_dx)))
+        self.look_dy = max(-2.5, min(2.5, float(look_dy)))
+        self._blink = bool(blink)
+        self._phase = float(phase)
+        self.update()
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = float(self.width())
+        h = float(self.height())
+        side = max(24.0, min(w, h) - 6.0)
+        cx = w / 2.0
+        cy = h / 2.0
+        radius = side / 2.0
+
+        glow_hex, fill_hex, stroke_hex = _MOOD_PALETTE.get(self.mood, _MOOD_PALETTE["idle"])
+        glow_color = QColor(glow_hex)
+        glow_color.setAlpha(110 if self.mood == "working" else 75)
+        pulse = 1.5 * math.sin(self._phase) if self.mood == "working" else 0.0
+        glow_radius = radius + 2.5 + pulse
+
+        # Outer aura ring
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(glow_color))
+        painter.drawEllipse(QPointF(cx, cy), glow_radius, glow_radius)
+
+        # Circular head
+        painter.setPen(QPen(QColor(stroke_hex), 2.0))
+        painter.setBrush(QBrush(QColor(fill_hex)))
+        painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+        # Eyes
+        eye_offset_x = radius * 0.34
+        eye_y = cy - radius * 0.14
+        eye_r = max(2.8, radius * 0.17)
+        pupil_r = max(1.5, eye_r * 0.56)
+
+        if self._blink:
+            painter.setPen(QPen(QColor(stroke_hex), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for sign in (-1.0, 1.0):
+                ex = cx + sign * eye_offset_x
+                painter.drawLine(QPointF(ex - eye_r, eye_y), QPointF(ex + eye_r, eye_y))
+        else:
+            for sign in (-1.0, 1.0):
+                ex = cx + sign * eye_offset_x
+                painter.setPen(QPen(QColor(stroke_hex), 1.2))
+                painter.setBrush(QBrush(QColor("#ffffff")))
+                painter.drawEllipse(QPointF(ex, eye_y), eye_r, eye_r)
+
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(stroke_hex)))
+                painter.drawEllipse(
+                    QPointF(ex + self.look_dx * 0.7, eye_y + self.look_dy * 0.7),
+                    pupil_r,
+                    pupil_r,
+                )
+
+        # Mouth
+        painter.setPen(QPen(QColor(stroke_hex), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        mouth_y = cy + radius * 0.25
+        mouth_w = radius * 0.62
+
+        if self.mood in ("working", "completed", "idle"):
+            arc_rect = QRectF(cx - mouth_w / 2.0, mouth_y - radius * 0.16, mouth_w, radius * 0.34)
+            painter.drawArc(arc_rect, 200 * 16, 140 * 16)
+        elif self.mood in ("paused", "approval"):
+            o_r = max(2.2, radius * 0.14)
+            painter.drawEllipse(QPointF(cx, mouth_y + 1.0), o_r, o_r)
+        else:
+            path = QPainterPath()
+            path.moveTo(cx - mouth_w / 2.0, mouth_y + radius * 0.12)
+            path.quadTo(cx, mouth_y - radius * 0.18, cx + mouth_w / 2.0, mouth_y + radius * 0.12)
+            painter.drawPath(path)
+
+
+class BotCharacterOverlay(QWidget):
+    """Floating, click-through circular bot character that moves near the cursor while active."""
+
+    def __init__(self, driver: BaseDesktopDriver, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.driver = driver
+        self.current_mood: str = "idle"
+        self.status_text: str = "Idle"
+        self._phase: float = 0.0
+        self._tick_count: int = 0
+        self._last_cursor: Optional[tuple[int, int]] = None
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        self.face_widget = BotFaceWidget(self)
+        self.face_widget.setFixedSize(56, 56)
+        layout.addWidget(self.face_widget)
+
+        self.badge_label = QLabel("Idle", self)
+        self.badge_label.setStyleSheet(
+            "background-color: rgba(15, 23, 42, 220);"
+            "color: #f8fafc;"
+            "font-weight: bold;"
+            "padding: 6px 12px;"
+            "border-radius: 14px;"
+            "border: 1px solid rgba(148, 163, 184, 140);"
+        )
+        layout.addWidget(self.badge_label)
+
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(40)
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide_overlay)
+
+    @staticmethod
+    def _is_headless_or_test_mode() -> bool:
+        return (
+            os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1"
+            or os.environ.get("QT_QPA_PLATFORM") == "offscreen"
+        )
+
+    def set_bot_state(self, mood: str, status_text: str) -> None:
+        """Update character mood and floating pill badge text."""
+        self.current_mood = mood
+        self.status_text = status_text
+        self.badge_label.setText(status_text)
+        self.face_widget.set_state(mood, phase=self._phase)
+        self.adjustSize()
+
+    def show_overlay(self) -> None:
+        """Display the floating character overlay without stealing focus."""
+        self._hide_timer.stop()
+        if self._is_headless_or_test_mode():
+            return
+        self._on_anim_tick()
+        self.show()
+        self.raise_()
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+    def hide_overlay(self) -> None:
+        """Stop animation timer and hide the floating character overlay."""
+        self._hide_timer.stop()
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self.hide()
+
+    def hide_after_delay(self, delay_ms: int) -> None:
+        """Hide the overlay after a brief completion/stop banner pause."""
+        if self._is_headless_or_test_mode():
+            self.hide_overlay()
+            return
+        self._hide_timer.start(max(0, int(delay_ms)))
+
+    def _on_anim_tick(self) -> None:
+        try:
+            cx, cy = self.driver.get_cursor_position()
+            sw, sh = self.driver.get_screen_size()
+        except Exception:
+            return
+
+        look_dx = 0.0
+        look_dy = 0.0
+        if self._last_cursor is not None:
+            dx = cx - self._last_cursor[0]
+            dy = cy - self._last_cursor[1]
+            look_dx = max(-2.5, min(2.5, dx * 0.25))
+            look_dy = max(-2.5, min(2.5, dy * 0.25))
+        self._last_cursor = (cx, cy)
+
+        self._phase += 0.22
+        self._tick_count += 1
+        blink = (self._tick_count % 75) in (0, 1)
+        bob_y = int(round(4.0 * math.sin(self._phase)))
+
+        self.face_widget.set_state(
+            self.current_mood,
+            look_dx=look_dx,
+            look_dy=look_dy,
+            blink=blink,
+            phase=self._phase,
+        )
+
+        self.adjustSize()
+        ox = max(8, min(max(8, sw - self.width() - 8), cx + 24))
+        oy = max(8, min(max(8, sh - self.height() - 8), cy + 24 + bob_y))
+        self.move(ox, oy)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._hide_timer.stop()
+        self._anim_timer.stop()
+        super().closeEvent(event)
 
 
 class DesktopControllerWindow(QMainWindow):
@@ -103,6 +356,7 @@ class DesktopControllerWindow(QMainWindow):
         self._approval_event = threading.Event()
         self._last_pixmap: Optional[QPixmap] = None
         self._engine_thread: Optional[threading.Thread] = None
+        self.character_overlay = BotCharacterOverlay(driver=self.driver)
 
         self.setWindowTitle("Window B - Autonomous Windows Desktop Controller")
         self.setGeometry(970, 40, 920, 960)
@@ -120,7 +374,7 @@ class DesktopControllerWindow(QMainWindow):
 
         if initial_backend in BACKEND_OPTIONS:
             self.backend_combo.setCurrentText(initial_backend)
-        self._refresh_backend_status()
+        self._on_backend_changed(self.backend_combo.currentText())
 
         if initial_task:
             self.task_input.setText(initial_task)
@@ -156,6 +410,18 @@ class DesktopControllerWindow(QMainWindow):
         self.task_input.setPlaceholderText("Enter natural-language desktop task...")
         input_row.addWidget(self.task_input, stretch=1)
         task_layout.addLayout(input_row)
+
+        api_key_row = QHBoxLayout()
+        api_key_row.addWidget(QLabel("API Key:", self))
+        self.api_key_input = QLineEdit(self)
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText(
+            "Optional API Key (AIza... for Gemini, sk-... for OpenAI, or set in .env)"
+        )
+        api_key_row.addWidget(self.api_key_input, stretch=1)
+        self.save_key_button = QPushButton("Save Key", self)
+        api_key_row.addWidget(self.save_key_button)
+        task_layout.addLayout(api_key_row)
 
         # Speed & Backend row
         controls_row = QHBoxLayout()
@@ -220,12 +486,15 @@ class DesktopControllerWindow(QMainWindow):
         safety_layout.addLayout(btn_row)
 
         status_row = QHBoxLayout()
+        self.bot_avatar = BotFaceWidget(self)
+        self.bot_avatar.setFixedSize(48, 48)
         self.status_label = QLabel("Idle (Start Authorization Required)", self)
         self.status_label.setStyleSheet("font-weight: bold;")
         self.current_action_label = QLabel("Action: None", self)
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        status_row.addWidget(self.bot_avatar)
         status_row.addWidget(self.status_label, stretch=1)
         status_row.addWidget(self.current_action_label, stretch=1)
         status_row.addWidget(self.progress_bar, stretch=1)
@@ -288,7 +557,9 @@ class DesktopControllerWindow(QMainWindow):
         self.speed_combo.currentTextChanged.connect(self._on_speed_preset_changed)
         self.duration_spin.valueChanged.connect(self._on_custom_spin_changed)
         self.delay_spin.valueChanged.connect(self._on_custom_spin_changed)
-        self.backend_combo.currentTextChanged.connect(lambda _: self._refresh_backend_status())
+        self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
+        self.api_key_input.textChanged.connect(self._on_api_key_changed)
+        self.save_key_button.clicked.connect(self.on_save_key_clicked)
 
         self.start_button.clicked.connect(self.on_start_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
@@ -345,15 +616,53 @@ class DesktopControllerWindow(QMainWindow):
             self.speed_combo.blockSignals(False)
         self.driver.speed_config = self.current_speed_config()
 
+    def _on_backend_changed(self, backend: str) -> None:
+        saved = get_saved_api_key_for_backend(backend)
+        current = self.api_key_input.text().strip()
+        if saved:
+            self.api_key_input.blockSignals(True)
+            self.api_key_input.setText(saved)
+            self.api_key_input.blockSignals(False)
+        elif (
+            backend in {"Local Demo / Fallback", "Local Ollama"}
+            or (backend == "Gemini API" and current.startswith("sk-"))
+            or (backend == "OpenAI API" and current.startswith(("AIza", "AQ.")))
+        ):
+            self.api_key_input.blockSignals(True)
+            self.api_key_input.clear()
+            self.api_key_input.blockSignals(False)
+        self._refresh_backend_status()
+
+    def on_save_key_clicked(self) -> None:
+        key = self.api_key_input.text().strip()
+        if not key:
+            self.backend_status_label.setText("Enter an API key first")
+            return
+        self._on_api_key_changed(key)
+        var_name = save_api_key_to_dotenv(self.backend_combo.currentText(), key)
+        self._refresh_backend_status()
+        if var_name:
+            self.append_history_row("api_key", "saved", f"Saved {var_name} to .env")
+
+    def _on_api_key_changed(self, text: str) -> None:
+        key = text.strip()
+        if self.backend_combo.currentText() == "Local Demo / Fallback":
+            if key.startswith(("AIza", "AQ.")):
+                self.backend_combo.setCurrentText("Gemini API")
+            elif key.startswith("sk-"):
+                self.backend_combo.setCurrentText("OpenAI API")
+        self._refresh_backend_status()
+
     def _refresh_backend_status(self) -> None:
         backend = self.backend_combo.currentText()
+        inline_key = self.api_key_input.text().strip() if hasattr(self, "api_key_input") else ""
         if backend == "Local Demo / Fallback":
             self.backend_status_label.setText("Ready (Local Demo)")
         elif backend == "Gemini API":
-            has_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+            has_key = bool(inline_key or os.environ.get("GEMINI_API_KEY", "").strip())
             self.backend_status_label.setText("Configured (Key Present)" if has_key else "Missing GEMINI_API_KEY")
         elif backend == "OpenAI API":
-            has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+            has_key = bool(inline_key or os.environ.get("OPENAI_API_KEY", "").strip())
             self.backend_status_label.setText("Configured (Key Present)" if has_key else "Missing OPENAI_API_KEY")
         elif backend == "Local Ollama":
             if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1":
@@ -410,6 +719,10 @@ class DesktopControllerWindow(QMainWindow):
         )
         self.screenshot_label.setPixmap(scaled)
 
+    def _update_bot_character(self, mood: str, status_text: str) -> None:
+        self.bot_avatar.set_state(mood)
+        self.character_overlay.set_bot_state(mood, status_text)
+
     def set_progress(self, current: int, total: int, action_text: str) -> None:
         """Update progress bar and current action status text."""
         safe_total = max(int(total), 1)
@@ -417,6 +730,7 @@ class DesktopControllerWindow(QMainWindow):
         self.progress_bar.setRange(0, safe_total)
         self.progress_bar.setValue(safe_current)
         self.current_action_label.setText(action_text)
+        self._update_bot_character("working", f"[{safe_current}/{safe_total}] {action_text[:48]}")
 
     def append_history_row(
         self,
@@ -461,6 +775,7 @@ class DesktopControllerWindow(QMainWindow):
         self.approve_button.setEnabled(True)
         self.deny_button.setEnabled(True)
         self.status_label.setText("Awaiting User Approval")
+        self._update_bot_character("approval", "Awaiting Approval")
         self.append_history_row("request_approval", "pending", f"[{risk_category}] {reason}")
         self.approval_requested.emit(reason, risk_category, details)
 
@@ -554,6 +869,10 @@ class DesktopControllerWindow(QMainWindow):
             self.deny_button.setEnabled(False)
             self.approval_group.setStyleSheet("")
         self._refresh_safety_ui()
+        self._update_bot_character("stopped", "EMERGENCY STOP")
+        self.character_overlay.hide_after_delay(1500)
+        if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.showNormal()
         self.append_history_row("emergency_stop", "halted", f"Source: {source}")
         self.emergency_stopped.emit(source)
 
@@ -565,15 +884,22 @@ class DesktopControllerWindow(QMainWindow):
             self.append_history_row("start", "blocked", str(exc))
             return
 
+        inline_key = self.api_key_input.text().strip()
+        if inline_key:
+            save_api_key_to_dotenv(self.backend_combo.currentText(), inline_key)
+
         self.driver.speed_config = self.current_speed_config()
         self._refresh_safety_ui()
         task_text = self.task_input.text().strip() or self.preset_task_combo.currentText()
         backend_name = self.backend_combo.currentText()
+        self._update_bot_character("working", "Working: Starting task...")
+        self.character_overlay.show_overlay()
         self.append_history_row("start", "authorized", f"Task: {task_text}")
         self.start_requested.emit(task_text, backend_name)
 
         # Optional M3 engine integration (only active once controller.engine exists)
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.showMinimized()
             self._try_launch_engine(task_text, backend_name)
 
     def _on_status_signal(self, status_text: str) -> None:
@@ -586,6 +912,12 @@ class DesktopControllerWindow(QMainWindow):
             self.current_action_label.setText(summary[:80])
         if status == "completed":
             self.progress_bar.setValue(self.progress_bar.maximum())
+        mood = "completed" if status == "completed" else "failed"
+        badge_msg = summary[:48] if summary else f"Task {status.capitalize()}"
+        self._update_bot_character(mood, badge_msg)
+        self.character_overlay.hide_after_delay(2000)
+        if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.showNormal()
 
     def _try_launch_engine(self, task_text: str, backend_name: str) -> None:
         if self._engine_thread is not None and self._engine_thread.is_alive():
@@ -621,6 +953,8 @@ class DesktopControllerWindow(QMainWindow):
                 result.summary or result.error or "",
             )
 
+        runtime_api_key = self.api_key_input.text().strip() or None
+
         def _worker() -> None:
             try:
                 engine = DesktopExecutionEngine(
@@ -628,6 +962,7 @@ class DesktopControllerWindow(QMainWindow):
                     safety=self.safety,
                     store=self.store,
                     backend_name=backend_name,
+                    api_key=runtime_api_key,
                     approval_callback=_on_approval,
                     progress_callback=_on_progress,
                     screenshot_callback=_on_screenshot,
@@ -645,6 +980,7 @@ class DesktopControllerWindow(QMainWindow):
     def on_pause_clicked(self) -> None:
         self.safety.pause()
         self._refresh_safety_ui()
+        self._update_bot_character("paused", "Paused (Esc)")
         self.append_history_row("pause", "paused", "Operator paused execution")
 
     def on_resume_clicked(self) -> None:
@@ -655,12 +991,14 @@ class DesktopControllerWindow(QMainWindow):
             self.append_history_row("resume", "blocked", str(exc))
             return
         self._refresh_safety_ui()
+        self._update_bot_character("working", "Resumed")
         self.append_history_row("resume", "running", "Operator resumed execution")
 
     def on_takeover_clicked(self) -> None:
         if not self.safety.manual_takeover:
             self.safety.enter_manual_takeover()
             self._refresh_safety_ui()
+            self._update_bot_character("paused", "Manual Takeover")
             self.append_history_row("manual_takeover", "active", "Operator took manual control")
         else:
             try:
@@ -670,6 +1008,7 @@ class DesktopControllerWindow(QMainWindow):
                 self.append_history_row("manual_takeover", "blocked", str(exc))
                 return
             self._refresh_safety_ui()
+            self._update_bot_character("working", "Automation Resumed")
             self.append_history_row("manual_takeover", "exited", "Returned control to automation")
 
     def on_emergency_stop_clicked(self) -> None:
@@ -678,6 +1017,8 @@ class DesktopControllerWindow(QMainWindow):
     def on_reset_stop_clicked(self) -> None:
         self.safety.reset_emergency_stop()
         self._refresh_safety_ui()
+        self._update_bot_character("idle", "Idle (Reset)")
+        self.character_overlay.hide_overlay()
         self.append_history_row("reset_stop", "cleared", "Emergency stop cleared; press Start to authorize")
 
     def on_approve_clicked(self) -> None:
@@ -689,6 +1030,7 @@ class DesktopControllerWindow(QMainWindow):
         self.approval_group.setStyleSheet("")
         self.approval_details_label.setText("Approved by operator.")
         self._refresh_safety_ui()
+        self._update_bot_character("working", "Approved - Continuing...")
         self.append_history_row("approval", "approved", self.approval_info.get("reason", ""))
         self.approval_resolved.emit(True)
 
@@ -701,11 +1043,13 @@ class DesktopControllerWindow(QMainWindow):
         self.approval_group.setStyleSheet("")
         self.approval_details_label.setText("Denied by operator.")
         self._refresh_safety_ui()
+        self._update_bot_character("failed", "Action Denied")
         self.append_history_row("approval", "denied", self.approval_info.get("reason", ""))
         self.approval_resolved.emit(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._poll_timer is not None:
             self._poll_timer.stop()
+        self.character_overlay.close()
         self._approval_event.set()
         super().closeEvent(event)

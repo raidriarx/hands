@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 from controller.driver import create_driver
 from controller.emergency import SafetyController
 from controller.gui import MILESTONE_4_PRESET, DesktopControllerWindow
+from controller.planners import _load_dotenv_if_present
 from controller.schema import SpeedConfig
 
 
@@ -52,6 +53,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Remove stale approved_workspace/milestone4_demo.txt before starting.",
     )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help="Automatically authorize and start the initial task 1 second after launching Window B.",
+    )
     return parser
 
 
@@ -68,11 +74,23 @@ def _create_optional_store() -> Optional[Any]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Launch Window B Desktop Controller or execute a headless smoke check."""
+    _load_dotenv_if_present()
+    (Path(__file__).resolve().parent / "approved_workspace").mkdir(parents=True, exist_ok=True)
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
     if args.headless_check:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+    elif (
+        not args.live_demo_notepad
+        and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
+        and args.backend == "Local Demo / Fallback"
+    ):
+        if os.environ.get("GEMINI_API_KEY", "").strip():
+            args.backend = "Gemini API"
+        elif os.environ.get("OPENAI_API_KEY", "").strip():
+            args.backend = "OpenAI API"
 
     app = QApplication.instance()
     owns_app = app is None
@@ -99,7 +117,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         store=store,
         initial_speed=args.speed,
         initial_task=task_text,
-        auto_start_demo=bool(args.live_demo_notepad and not args.headless_check),
+        auto_start_demo=bool((args.live_demo_notepad or args.auto_start) and not args.headless_check),
         initial_backend=args.backend,
     )
 

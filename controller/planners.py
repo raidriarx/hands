@@ -6,12 +6,14 @@ import base64
 import io
 import json
 import os
+import re
+import urllib.parse
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 from controller.policy import APPROVED_WORKSPACE
@@ -19,12 +21,127 @@ from controller.schema import ActionType, DesktopAction
 
 _SYSTEM_INSTRUCTION = (
     "You are an autonomous Windows desktop planner. Respond ONLY with a single JSON object "
-    "matching the DesktopAction schema: {action_type, description, x, y, text, keys, clicks, "
+    "matching the DesktopAction schema: {action_type, description, x, y, mark_id, text, keys, clicks, "
     "seconds, app_name, target_path, expected_text, reason, risk_category}. "
     "Valid action_type values: click, double_click, move, type_text, press_keys, scroll, wait, "
     "launch_app, verify_state, request_approval, done, fail. "
-    "All file writes must stay inside approved_workspace. Omit null/unused optional fields or set null."
+    "COORDINATES: Every screenshot uses a normalized 0..1000 coordinate grid regardless of actual screen pixels: "
+    "top-left=(0,0), center=(500,500), bottom-right=(1000,1000). Always return x and y in [0, 1000] aimed at the "
+    "visual center of the target control (no mark_id needed unless som_marks is provided). "
+    "Use bare application names in launch_app (e.g. 'firefox', 'msedge', 'chrome', 'notepad', 'calc'). "
+    "All file writes and target_path values must stay inside approved_workspace; NEVER put a URL in target_path. "
+    "DIRECT SEARCH URLS: When searching or playing music/videos on YouTube Music or YouTube, NEVER go to the homepage "
+    "and guess search bar coordinates. Instead, press ['ctrl', 'l'], type_text the direct search URL "
+    "'https://music.youtube.com/search?q=<url_encoded_query>', and press ['enter']! "
+    "To open a website or web app in a browser: "
+    "(1) launch_app with app_name='firefox' (or 'msedge'/'chrome'), "
+    "(2) wait 2 seconds, "
+    "(3) press_keys ['ctrl', 'l'] to focus the address bar, "
+    "(4) type_text the full https://... URL, "
+    "(5) press_keys ['enter'], "
+    "(6) wait for the page to load, then interact via keyboard shortcuts or coordinates from the screenshot. "
+    "SELF-CORRECTION & CURSOR RETICLE: Each screenshot displays a red CURSOR (x,y) crosshair at your current cursor "
+    "position, coordinate ticks along the top/left edges, and a 1:1 ZOOM inset in the bottom-right corner around "
+    "the cursor for fine aiming. If you just launched an app and it is not in the foreground, click inside its window "
+    "to focus it like a human before typing or pressing shortcuts. Check screen_changed_last_step and last_error in the "
+    "Observation: if your previous click or typing did NOT change the screen (screen_changed_last_step is false) or "
+    "last_error warns of a repeated action/coordinate, DO NOT click the same (x, y) or repeat the same cycle—adjust "
+    "coordinates, use detected_ui_hints.youtube_music_play_button_xy if present, or use keyboard shortcuts "
+    "(Ctrl+L for URL bar, / for web search box, Space for play/pause). "
+    "Only set reason and risk_category when action_type is 'request_approval' or 'fail'; leave them null for normal actions. "
+    "Omit null/unused optional fields or set null."
 )
+
+
+ENV_FILE_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _load_dotenv_if_present(env_path: Optional[Path] = None) -> None:
+    """Load key/value pairs from desktop-controller/.env if available without overriding env."""
+    if env_path is None and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1":
+        return
+    target = env_path or ENV_FILE_PATH
+    if not target.is_file():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(target, override=False)
+        return
+    except ImportError:
+        pass
+    except Exception:
+        return
+    try:
+        for raw_line in target.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            if key and not os.environ.get(key, "").strip():
+                os.environ[key] = val
+    except Exception:
+        pass
+
+
+def save_api_key_to_dotenv(
+    backend_name: str,
+    api_key: str,
+    env_path: Optional[Path] = None,
+) -> Optional[str]:
+    """Persist an API key to os.environ and desktop-controller/.env, returning the env var name."""
+    key = api_key.strip()
+    if not key:
+        return None
+
+    lower_backend = backend_name.lower()
+    if key.startswith(("AIza", "AQ.")) or "gemini" in lower_backend:
+        var_name = "GEMINI_API_KEY"
+    elif key.startswith("sk-") or "openai" in lower_backend:
+        var_name = "OPENAI_API_KEY"
+    else:
+        return None
+
+    os.environ[var_name] = key
+
+    if env_path is not None or os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+        target = env_path or ENV_FILE_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing_lines: list[str] = []
+        if target.is_file():
+            existing_lines = target.read_text(encoding="utf-8").splitlines()
+
+        prefix = f"{var_name}="
+        updated_lines: list[str] = []
+        replaced = False
+        for line in existing_lines:
+            if line.strip().startswith(prefix):
+                updated_lines.append(f"{var_name}={key}")
+                replaced = True
+            else:
+                updated_lines.append(line)
+        if not replaced:
+            updated_lines.append(f"{var_name}={key}")
+        target.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
+
+    return var_name
+
+
+def get_saved_api_key_for_backend(backend_name: str) -> str:
+    """Return the configured/saved API key for Gemini API or OpenAI API, else empty string."""
+    _load_dotenv_if_present()
+    lower_backend = backend_name.lower()
+    if "gemini" in lower_backend:
+        return os.environ.get("GEMINI_API_KEY", "").strip()
+    if "openai" in lower_backend:
+        return os.environ.get("OPENAI_API_KEY", "").strip()
+    return ""
 
 
 def _strip_json_fences(raw: str) -> str:
@@ -39,11 +156,240 @@ def _strip_json_fences(raw: str) -> str:
     return text
 
 
+def extract_som_marks(
+    screenshot: Optional[Image.Image],
+    screen_size: tuple[int, int],
+    max_marks: int = 24,
+) -> dict[int, tuple[int, int]]:
+    """Detect high-contrast UI regions/buttons on the screenshot and return numbered {id: (x, y)} marks."""
+    if screenshot is None:
+        return {}
+    sw = max(1, int(screen_size[0]))
+    sh = max(1, int(screen_size[1]))
+    dw, dh = 480, 270
+    small = screenshot.convert("L").resize((dw, dh), Image.Resampling.BILINEAR)
+    raw = small.tobytes()
+
+    # Scan for bright or high-contrast horizontal UI spans (buttons, pills, search bars, cards)
+    clusters: list[list[int]] = []  # [min_x, max_x, min_y, max_y]
+    for ry in range(18, dh - 14, 2):
+        row_off = ry * dw
+        run_start: Optional[int] = None
+        runs: list[tuple[int, int]] = []
+        for rx in range(6, dw - 6):
+            lum = raw[row_off + rx]
+            # Detect bright UI elements (>= 195) or strong horizontal edge transitions
+            if lum >= 195:
+                if run_start is None:
+                    run_start = rx
+            elif run_start is not None:
+                if 8 <= (rx - run_start) <= 140:
+                    runs.append((run_start, rx - 1))
+                run_start = None
+        if run_start is not None and 8 <= (dw - 6 - run_start) <= 140:
+            runs.append((run_start, dw - 7))
+
+        for r_x0, r_x1 in runs:
+            matched: Optional[list[int]] = None
+            for c in clusters:
+                if (ry - c[3]) <= 4 and not (r_x1 < c[0] or r_x0 > c[1]):
+                    matched = c
+                    break
+            if matched is not None:
+                matched[0] = min(matched[0], r_x0)
+                matched[1] = max(matched[1], r_x1)
+                matched[3] = ry
+            else:
+                clusters.append([r_x0, r_x1, ry, ry])
+
+    candidates: list[tuple[int, int]] = []
+    for c in clusters:
+        cw = c[1] - c[0] + 1
+        ch = c[3] - c[2] + 1
+        if 8 <= cw <= 140 and 4 <= ch <= 36:
+            cx = max(10, min(sw - 10, int(round(((c[0] + c[1]) / 2.0) * (sw / dw)))))
+            cy = max(10, min(sh - 10, int(round(((c[2] + c[3]) / 2.0) * (sh / dh)))))
+            if not any(abs(cx - px) < 38 and abs(cy - py) < 28 for px, py in candidates):
+                candidates.append((cx, cy))
+
+    candidates.sort(key=lambda pt: (pt[1] // 40, pt[0]))
+    return {idx + 1: pt for idx, pt in enumerate(candidates[:max_marks])}
+
+
+def annotate_screenshot_for_planner(
+    screenshot: Optional[Image.Image],
+    cursor_pos: tuple[int, int],
+    screen_size: tuple[int, int],
+    detected_ui_hints: Optional[dict[str, Any]] = None,
+    som_marks: Optional[dict[int, tuple[int, int]] | dict[int, list[int]]] = None,
+) -> Optional[Image.Image]:
+    """Overlay pixel ruler ticks, Set-of-Mark [id] badges, CURSOR reticle, and UI hint boxes."""
+    if screenshot is None:
+        return None
+    annotated = screenshot.convert("RGB").copy()
+    w, h = annotated.size
+    sw = max(1, int(screen_size[0]))
+    sh = max(1, int(screen_size[1]))
+    scale_x = w / sw
+    scale_y = h / sh
+    draw = ImageDraw.Draw(annotated)
+
+    # Coordinate ruler along top and left edges every 200 screen px
+    for sx in range(200, sw, 200):
+        px = max(0, min(w - 1, int(round(sx * scale_x))))
+        draw.line([(px, 0), (px, 10)], fill=(255, 230, 60), width=2)
+        if px + 36 < w:
+            draw.rectangle([px + 2, 2, px + 38, 16], fill=(15, 23, 42))
+            draw.text((px + 4, 3), str(sx), fill=(255, 230, 60))
+    for sy in range(200, sh, 200):
+        py = max(0, min(h - 1, int(round(sy * scale_y))))
+        draw.line([(0, py), (10, py)], fill=(255, 230, 60), width=2)
+        if py + 16 < h:
+            draw.rectangle([2, py + 2, 38, py + 16], fill=(15, 23, 42))
+            draw.text((4, py + 3), str(sy), fill=(255, 230, 60))
+
+    # Highlight detected YouTube Music Play button hint if available
+    if detected_ui_hints and isinstance(detected_ui_hints.get("youtube_music_play_button_xy"), (list, tuple)):
+        coords = detected_ui_hints["youtube_music_play_button_xy"]
+        if len(coords) == 2:
+            hx, hy = int(coords[0]), int(coords[1])
+            bx = max(0, min(w - 1, int(round(hx * scale_x))))
+            by = max(0, min(h - 1, int(round(hy * scale_y))))
+            draw.rectangle(
+                [max(0, bx - 22), max(0, by - 14), min(w - 1, bx + 22), min(h - 1, by + 14)],
+                outline=(34, 197, 94),
+                width=3,
+            )
+            play_label = f"PLAY_BTN ({hx},{hy})"
+            blx = bx + 26 if bx + 165 < w else max(4, bx - 165)
+            bly = max(4, by - 14) if by - 14 >= 4 else min(h - 22, by + 18)
+            draw.rectangle([blx, bly, min(w - 1, blx + 136), min(h - 1, bly + 18)], fill=(21, 128, 61))
+            draw.text((blx + 4, bly + 3), play_label, fill=(255, 255, 255))
+
+    # Draw Set-of-Mark numbered badges [1], [2], ...
+    if som_marks:
+        for mid, coords in som_marks.items():
+            mx, my = int(coords[0]), int(coords[1])
+            bx = max(0, min(w - 1, int(round(mx * scale_x))))
+            by = max(0, min(h - 1, int(round(my * scale_y))))
+            tag = f"[{mid}]"
+            tw = 10 + 7 * len(tag)
+            tx = max(2, min(w - tw - 2, bx - tw // 2))
+            ty = max(2, min(h - 18, by - 9))
+            draw.rectangle([tx, ty, tx + tw, ty + 16], fill=(234, 88, 12), outline=(255, 255, 255), width=1)
+            draw.text((tx + 4, ty + 2), tag, fill=(255, 255, 255))
+
+    # Red/magenta cursor reticle and label
+    cx = max(0, min(w - 1, int(round(cursor_pos[0] * scale_x))))
+    cy = max(0, min(h - 1, int(round(cursor_pos[1] * scale_y))))
+    draw.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], outline=(255, 40, 120), width=3)
+    draw.line([(max(0, cx - 24), cy), (min(w - 1, cx + 24), cy)], fill=(255, 230, 60), width=2)
+    draw.line([(cx, max(0, cy - 24)), (cx, min(h - 1, cy + 24))], fill=(255, 230, 60), width=2)
+    label = f"CURSOR ({int(cursor_pos[0])},{int(cursor_pos[1])})"
+    lx = cx + 18 if cx + 150 < w else max(4, cx - 150)
+    ly = cy + 14 if cy + 32 < h else max(4, cy - 28)
+    draw.rectangle([lx, ly, min(w - 1, lx + 132), min(h - 1, ly + 18)], fill=(185, 28, 28))
+    draw.text((lx + 4, ly + 3), label, fill=(255, 255, 255))
+    return annotated
+
+
+def compute_screenshot_change_ratio(
+    before: Optional[Image.Image],
+    after: Optional[Image.Image],
+) -> float:
+    """Return fraction of downsampled pixels whose intensity changed by >12 between screenshots."""
+    if before is None or after is None:
+        return 1.0
+    b_small = before.convert("L").resize((160, 90))
+    a_small = after.convert("L").resize((160, 90))
+    b_bytes = b_small.tobytes()
+    a_bytes = a_small.tobytes()
+    if not b_bytes:
+        return 0.0
+    changed = sum(1 for x, y in zip(b_bytes, a_bytes) if abs(x - y) > 12)
+    return changed / float(len(b_bytes))
+
+
+def create_foveated_screenshot(
+    screenshot: Optional[Image.Image],
+    cursor_pos: tuple[int, int],
+    screen_size: tuple[int, int],
+    max_width: int = 960,
+    zoom_size: tuple[int, int] = (320, 240),
+) -> Optional[Image.Image]:
+    """Downscale full screen for token efficiency while embedding a 1:1 high-res cursor zoom inset."""
+    if screenshot is None:
+        return None
+    full = screenshot.convert("RGB")
+    w, h = full.size
+    sw = max(1, int(screen_size[0]))
+    sh = max(1, int(screen_size[1]))
+
+    # 1:1 high-res crop around cursor in screenshot coordinates
+    zw = min(w, int(zoom_size[0]))
+    zh = min(h, int(zoom_size[1]))
+    cx = max(0, min(w - 1, int(round(cursor_pos[0] * (w / sw)))))
+    cy = max(0, min(h - 1, int(round(cursor_pos[1] * (h / sh)))))
+    zx0 = max(0, min(w - zw, cx - zw // 2))
+    zy0 = max(0, min(h - zh, cy - zh // 2))
+    zx1 = zx0 + zw
+    zy1 = zy0 + zh
+    zoom_patch = full.crop((zx0, zy0, zx1, zy1))
+
+    # Downscale full screen
+    if w > max_width:
+        new_h = max(1, int(round(h * (max_width / float(w)))))
+        base = full.resize((max_width, new_h), Image.Resampling.LANCZOS)
+    else:
+        base = full.copy()
+
+    bw, bh = base.size
+    if bw >= zw + 16 and bh >= zh + 28:
+        px = bw - zw - 8
+        py = bh - zh - 8
+        base.paste(zoom_patch, (px, py))
+        draw = ImageDraw.Draw(base)
+        draw.rectangle([px - 2, py - 2, px + zw + 1, py + zh + 1], outline=(56, 189, 248), width=2)
+        label = f"1:1 ZOOM ({zx0},{zy0})-({zx1},{zy1})"
+        draw.rectangle([px, max(0, py - 18), min(bw - 1, px + 210), py], fill=(15, 23, 42))
+        draw.text((px + 4, max(0, py - 15)), label, fill=(56, 189, 248))
+    return base
+
+
+def scale_normalized_coord(value: int, target_size: int) -> int:
+    """Scale a normalized 0..1000 coordinate to [0, target_size - 1] screen pixels."""
+    if target_size < 2:
+        return 0
+    clamped = max(0, min(1000, int(value)))
+    return max(0, min(target_size - 1, int(round((clamped / 1000.0) * (target_size - 1)))))
+
+
+def _parse_action_json(raw_text: str) -> DesktopAction:
+    cleaned = _strip_json_fences(raw_text)
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        return DesktopAction.model_validate_json(cleaned)
+    if isinstance(data, dict):
+        if not str(data.get("description") or "").strip():
+            at = str(data.get("action_type") or "action").strip()
+            data["description"] = f"Execute {at}"
+        if str(data.get("action_type") or "").lower() == "verify_state":
+            if not data.get("expected_text") and not data.get("target_path"):
+                data["expected_text"] = " - YouTube Music"
+        return DesktopAction.model_validate(data)
+    return DesktopAction.model_validate_json(cleaned)
+
+
 def _encode_screenshot_b64(screenshot: Optional[Image.Image]) -> Optional[str]:
     if screenshot is None:
         return None
+    img = screenshot
+    if img.width > 960:
+        new_h = max(1, int(round(img.height * (960.0 / img.width))))
+        img = img.resize((960, new_h), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    screenshot.save(buf, format="PNG")
+    img.convert("RGB").save(buf, format="JPEG", quality=65)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -54,6 +400,10 @@ def _build_observation_prompt(obs: ObservationContext) -> str:
         "screen_size": list(obs.screen_size),
         "cursor_pos": list(obs.cursor_pos),
         "active_window_rect": list(obs.active_window_rect) if obs.active_window_rect else None,
+        "active_window_title": obs.active_window_title,
+        "screen_changed_last_step": obs.screen_changed_last_step,
+        "som_marks": obs.som_marks,
+        "detected_ui_hints": obs.detected_ui_hints,
         "approved_workspace": obs.approved_workspace,
         "last_error": obs.last_error,
         "recent_history": obs.history[-8:],
@@ -69,6 +419,10 @@ class ObservationContext(BaseModel):
     screen_size: tuple[int, int] = (1920, 1080)
     cursor_pos: tuple[int, int] = (960, 540)
     active_window_rect: Optional[tuple[int, int, int, int]] = None
+    active_window_title: Optional[str] = None
+    screen_changed_last_step: Optional[bool] = None
+    som_marks: dict[int, list[int]] = Field(default_factory=dict)
+    detected_ui_hints: dict[str, Any] = Field(default_factory=dict)
     history: list[dict[str, Any]] = Field(default_factory=list)
     last_error: Optional[str] = None
     approved_workspace: str = str(APPROVED_WORKSPACE)
@@ -100,8 +454,10 @@ class GeminiPlanner(BasePlanner):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.1-flash-lite",
     ) -> None:
+        if api_key is None:
+            _load_dotenv_if_present()
         self._api_key = (
             api_key.strip()
             if api_key is not None
@@ -125,28 +481,52 @@ class GeminiPlanner(BasePlanner):
         parts: list[dict[str, Any]] = [{"text": _build_observation_prompt(obs)}]
         img_b64 = _encode_screenshot_b64(screenshot)
         if img_b64:
-            parts.append({"inlineData": {"mimeType": "image/png", "data": img_b64}})
+            parts.append({"inlineData": {"mimeType": "image/jpeg", "data": img_b64}})
 
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:generateContent"
-        )
-        resp = httpx.post(
-            url,
-            params={"key": self._api_key},
-            json={
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "temperature": 0.1,
-                },
-            },
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        candidate_models = [
+            self.model,
+            *(
+                m
+                for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest")
+                if m != self.model
+            ),
+        ]
+        data: dict[str, Any] = {}
+        for idx, model_name in enumerate(candidate_models):
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent"
+            )
+            try:
+                resp = httpx.post(
+                    url,
+                    params={"key": self._api_key},
+                    json={
+                        "contents": [{"parts": parts}],
+                        "generationConfig": {
+                            "responseMimeType": "application/json",
+                            "temperature": 0.1,
+                        },
+                    },
+                    timeout=45.0,
+                )
+                resp.raise_for_status()
+            except httpx.TimeoutException:
+                if idx + 1 < len(candidate_models):
+                    continue
+                raise
+            except httpx.HTTPStatusError as exc:
+                if (
+                    exc.response.status_code in (404, 429, 500, 502, 503, 504)
+                    and idx + 1 < len(candidate_models)
+                ):
+                    continue
+                raise
+            data = resp.json()
+            break
+
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return DesktopAction.model_validate_json(_strip_json_fences(raw_text))
+        return _parse_action_json(raw_text)
 
 
 class OpenAIPlanner(BasePlanner):
@@ -159,6 +539,8 @@ class OpenAIPlanner(BasePlanner):
         api_key: Optional[str] = None,
         model: str = "gpt-4o-mini",
     ) -> None:
+        if api_key is None:
+            _load_dotenv_if_present()
         self._api_key = (
             api_key.strip()
             if api_key is not None
@@ -187,7 +569,7 @@ class OpenAIPlanner(BasePlanner):
             user_content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                 }
             )
 
@@ -208,7 +590,7 @@ class OpenAIPlanner(BasePlanner):
         resp.raise_for_status()
         data = resp.json()
         raw_text = data["choices"][0]["message"]["content"]
-        return DesktopAction.model_validate_json(_strip_json_fences(raw_text))
+        return _parse_action_json(raw_text)
 
 
 class OllamaPlanner(BasePlanner):
@@ -219,7 +601,7 @@ class OllamaPlanner(BasePlanner):
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "llama3.2-vision",
+        model: str = "qwen3.5:latest",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -243,6 +625,7 @@ class OllamaPlanner(BasePlanner):
             "prompt": _build_observation_prompt(obs),
             "format": "json",
             "stream": False,
+            "think": False,
         }
         img_b64 = _encode_screenshot_b64(screenshot)
         if img_b64:
@@ -251,16 +634,212 @@ class OllamaPlanner(BasePlanner):
         resp = httpx.post(
             f"{self.base_url}/api/generate",
             json=payload,
-            timeout=60.0,
+            timeout=120.0,
         )
         resp.raise_for_status()
         data = resp.json()
         raw_text = data["response"]
-        return DesktopAction.model_validate_json(_strip_json_fences(raw_text))
+        return _parse_action_json(raw_text)
+
+
+_BROWSER_MEDIA_PATTERN = re.compile(
+    r"(?i)\b(?:firefox|chrome|edge|msedge|browser|youtube|music)\b|https?://"
+)
+_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+_SONG_VERB_PATTERN = re.compile(
+    r"(?i)\b(?:turn on|put on|play|listen to|start playing)\b.*\bsong\b"
+)
+
+
+def is_browser_or_media_task(task_text: str) -> bool:
+    """Return True if task_text targets a web browser, URL, or music/YouTube playback."""
+    lower_task = task_text.lower()
+    if _BROWSER_MEDIA_PATTERN.search(lower_task):
+        return True
+    if _SONG_VERB_PATTERN.search(lower_task):
+        return True
+    return any(
+        phrase in lower_task
+        for phrase in (
+            "put on a song",
+            "turn on a song",
+            "play a song",
+            "play song",
+            "play music",
+            "turn on music",
+            "start playing",
+            "listen to",
+        )
+    )
+
+
+def _is_youtube_music_task(lower_task: str) -> bool:
+    if "youtube music" in lower_task:
+        return True
+    if "youtube" in lower_task and ("music" in lower_task or "song" in lower_task):
+        return True
+    if _SONG_VERB_PATTERN.search(lower_task):
+        return True
+    return any(
+        phrase in lower_task
+        for phrase in (
+            "put on a song",
+            "turn on a song",
+            "play a song",
+            "play song",
+            "play music",
+            "turn on music",
+            "start playing",
+            "listen to",
+        )
+    )
+
+
+def _extract_song_query(task_text: str) -> str:
+    text = task_text.strip()
+    song_wrap_match = re.search(
+        r"(?i)\b(?:turn on|put on|play|listen to)\s+(?:a|an|some|the)?\s*(.+?)\s+song\b",
+        text,
+    )
+    if song_wrap_match:
+        candidate = song_wrap_match.group(1).strip(" .!?,\"'")
+        for prefix in ("called ", "named ", "by "):
+            if candidate.lower().startswith(prefix):
+                candidate = candidate[len(prefix) :].strip(" .!?,\"'")
+        if candidate and candidate.lower() not in {"a", "an", "the", "good", "random", "nice"}:
+            return candidate
+
+    match = re.search(
+        r"(?i)(?:put on a song|turn on a song|play a song|play song|play music|turn on music|start playing|listen to|turn on|play)\s*(?:called|named|by|:|-)?\s*(.*)$",
+        text,
+    )
+    if match:
+        candidate = match.group(1).strip(" .!?,\"'")
+        for prefix in ("called ", "named ", "by ", "a ", "an ", "the "):
+            if candidate.lower().startswith(prefix):
+                candidate = candidate[len(prefix) :].strip(" .!?,\"'")
+        if candidate and candidate.lower() not in {
+            "on youtube music",
+            "on youtube",
+            "in firefox",
+            "in chrome",
+            "in edge",
+            "song",
+            "music",
+        }:
+            return candidate
+    return "lofi hip hop beats"
+
+
+def locate_youtube_music_play_button(
+    screenshot: Optional[Image.Image],
+    active_window_rect: Optional[tuple[int, int, int, int]],
+    screen_size: tuple[int, int],
+    retry_index: int = 0,
+) -> tuple[int, int]:
+    """Locate the white 'Play' pill button on YouTube Music's Top Result card, or return a fallback coordinate."""
+    sw = max(1, int(screen_size[0]))
+    sh = max(1, int(screen_size[1]))
+
+    if active_window_rect is not None:
+        rl, rt, rr, rb = active_window_rect
+        left = max(0, min(sw - 1, int(rl)))
+        top = max(0, min(sh - 1, int(rt)))
+        right = max(left + 1, min(sw, int(rr)))
+        bottom = max(top + 1, min(sh, int(rb)))
+    else:
+        left, top, right, bottom = 0, 0, sw, sh
+
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+
+    sidebar_margin = min(235, int(width * 0.16)) if width >= 1100 else min(76, int(width * 0.12))
+    x0 = max(0, left + sidebar_margin)
+    x1 = min(sw, left + int(width * 0.58))
+    y0 = max(0, top + int(height * 0.24))
+    y1 = min(sh, top + int(height * 0.72))
+
+    if screenshot is not None and screenshot.width >= sw // 2 and retry_index == 0:
+        scale_x = screenshot.width / sw
+        scale_y = screenshot.height / sh
+        sx0 = max(0, min(screenshot.width - 1, int(round(x0 * scale_x))))
+        sx1 = max(sx0 + 1, min(screenshot.width, int(round(x1 * scale_x))))
+        sy0 = max(0, min(screenshot.height - 1, int(round(y0 * scale_y))))
+        sy1 = max(sy0 + 1, min(screenshot.height, int(round(y1 * scale_y))))
+
+        min_w = max(12, int(round(35 * scale_x)))
+        max_w = max(min_w + 1, int(round(160 * scale_x)))
+        min_h = max(8, int(round(16 * scale_y)))
+        max_h = max(min_h + 1, int(round(60 * scale_y)))
+
+        crop_w = sx1 - sx0
+        crop_h = sy1 - sy0
+        if crop_w > 0 and crop_h > 0:
+            raw = screenshot.crop((sx0, sy0, sx1, sy1)).convert("RGB").tobytes()
+            row_stride = crop_w * 3
+            clusters: list[list[int]] = []  # [min_x, max_x, min_y, max_y]
+
+            for ry in range(0, crop_h, 2):
+                row_off = ry * row_stride
+                run_start: Optional[int] = None
+                runs_in_row: list[tuple[int, int]] = []
+                for rx in range(crop_w):
+                    idx = row_off + rx * 3
+                    is_white = raw[idx] >= 220 and raw[idx + 1] >= 220 and raw[idx + 2] >= 220
+                    if is_white:
+                        if run_start is None:
+                            run_start = rx
+                    elif run_start is not None:
+                        run_end = rx - 1
+                        if min_w <= (run_end - run_start + 1) <= max_w:
+                            runs_in_row.append((sx0 + run_start, sx0 + run_end))
+                        run_start = None
+                if run_start is not None:
+                    run_end = crop_w - 1
+                    if min_w <= (run_end - run_start + 1) <= max_w:
+                        runs_in_row.append((sx0 + run_start, sx0 + run_end))
+
+                abs_y = sy0 + ry
+                for r_x0, r_x1 in runs_in_row:
+                    matched_cluster: Optional[list[int]] = None
+                    for cluster in clusters:
+                        if (abs_y - cluster[3]) <= 4 and not (r_x1 < cluster[0] or r_x0 > cluster[1]):
+                            matched_cluster = cluster
+                            break
+                    if matched_cluster is not None:
+                        matched_cluster[0] = min(matched_cluster[0], r_x0)
+                        matched_cluster[1] = max(matched_cluster[1], r_x1)
+                        matched_cluster[3] = abs_y
+                    else:
+                        clusters.append([r_x0, r_x1, abs_y, abs_y])
+
+            pill_clusters = [
+                c
+                for c in clusters
+                if min_w <= (c[1] - c[0] + 1) <= max_w and min_h <= (c[3] - c[2] + 1) <= max_h
+            ]
+            if pill_clusters:
+                pill = min(pill_clusters, key=lambda c: (c[2], c[0]))
+                scx = (pill[0] + pill[1]) / 2.0
+                scy = (pill[2] + pill[3]) / 2.0
+                cx = max(10, min(sw - 10, int(round(scx / scale_x))))
+                cy = max(10, min(sh - 10, int(round(scy / scale_y))))
+                return cx, cy
+
+    if retry_index >= 1:
+        raw_x = left + max(180, int(width * 0.22))
+        raw_y = top + max(220, int(height * 0.36))
+    else:
+        raw_x = left + max(180, int(width * 0.23))
+        raw_y = top + max(240, int(height * 0.46))
+
+    return max(10, min(sw - 10, raw_x)), max(10, min(sh - 10, raw_y))
 
 
 class LocalDemoFallbackPlanner(BasePlanner):
-    """Deterministic local planner supporting Milestone 4 Notepad demo and workspace tasks."""
+    """Deterministic local planner supporting Milestone 4 Notepad demo, browser/media, and workspace tasks."""
 
     name: str = "Local Demo / Fallback"
 
@@ -277,6 +856,9 @@ class LocalDemoFallbackPlanner(BasePlanner):
         lower_task = obs.task_text.lower()
         if "notepad" in lower_task or "milestone 4" in lower_task:
             return self._plan_notepad_demo(obs)
+
+        if is_browser_or_media_task(obs.task_text):
+            return self._plan_browser_or_media_task(obs, screenshot=screenshot)
 
         if "verify" in lower_task or "workspace" in lower_task:
             if obs.step_index == 0:
@@ -300,6 +882,144 @@ class LocalDemoFallbackPlanner(BasePlanner):
             action_type=ActionType.done,
             description=f"Completed local demo execution for: {obs.task_text[:80]}",
         )
+
+    def _plan_browser_or_media_task(
+        self,
+        obs: ObservationContext,
+        screenshot: Optional[Image.Image] = None,
+    ) -> DesktopAction:
+        lower_task = obs.task_text.lower()
+        if re.search(r"\b(msedge|edge)\b", lower_task):
+            browser = "msedge"
+        elif re.search(r"\bchrome\b", lower_task):
+            browser = "chrome"
+        else:
+            browser = "firefox"
+
+        if _is_youtube_music_task(lower_task):
+            query = _extract_song_query(obs.task_text)
+            target_url = f"https://music.youtube.com/search?q={urllib.parse.quote_plus(query)}"
+            play_x, play_y = locate_youtube_music_play_button(
+                screenshot,
+                obs.active_window_rect,
+                obs.screen_size,
+            )
+
+            steps: list[DesktopAction] = [
+                DesktopAction(
+                    action_type=ActionType.launch_app,
+                    app_name=browser,
+                    description=f"Launch {browser} browser",
+                ),
+                DesktopAction(
+                    action_type=ActionType.wait,
+                    seconds=2.0,
+                    description=f"Wait for {browser} window to initialize",
+                ),
+                DesktopAction(
+                    action_type=ActionType.press_keys,
+                    keys=["ctrl", "l"],
+                    description="Focus browser address bar",
+                ),
+                DesktopAction(
+                    action_type=ActionType.type_text,
+                    text=target_url,
+                    description=f"Enter YouTube Music URL for: {query}",
+                ),
+                DesktopAction(
+                    action_type=ActionType.press_keys,
+                    keys=["enter"],
+                    description="Navigate to YouTube Music search results",
+                ),
+                DesktopAction(
+                    action_type=ActionType.wait,
+                    seconds=4.0,
+                    description="Wait for YouTube Music results to load",
+                ),
+                DesktopAction(
+                    action_type=ActionType.move,
+                    x=play_x,
+                    y=play_y,
+                    description="Move cursor to YouTube Music Play button",
+                ),
+                DesktopAction(
+                    action_type=ActionType.click,
+                    x=play_x,
+                    y=play_y,
+                    description="Click Play button to start song on YouTube Music",
+                ),
+                DesktopAction(
+                    action_type=ActionType.verify_state,
+                    expected_text=" - YouTube Music",
+                    description="Verify song is actively playing in YouTube Music",
+                ),
+                DesktopAction(
+                    action_type=ActionType.done,
+                    description=f"Verified song playback active on YouTube Music ({query})",
+                ),
+            ]
+        else:
+            url_match = _URL_PATTERN.search(obs.task_text)
+            if url_match:
+                target_url = url_match.group(0).rstrip(".,;:)]}")
+            else:
+                cleaned = re.sub(
+                    r"(?i)\b(?:open|launch|start|use|in|and|then|firefox|chrome|msedge|edge|browser|go to|navigate to|search for|search)\b",
+                    " ",
+                    obs.task_text,
+                )
+                cleaned = re.sub(r"\s+", " ", cleaned).strip(" .!?,\"'")
+                if cleaned:
+                    target_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(cleaned)}"
+                else:
+                    target_url = "https://www.google.com"
+
+            browser_verify_text = "edge" if browser == "msedge" else browser
+            steps = [
+                DesktopAction(
+                    action_type=ActionType.launch_app,
+                    app_name=browser,
+                    description=f"Launch {browser} browser",
+                ),
+                DesktopAction(
+                    action_type=ActionType.wait,
+                    seconds=2.0,
+                    description=f"Wait for {browser} window to initialize",
+                ),
+                DesktopAction(
+                    action_type=ActionType.press_keys,
+                    keys=["ctrl", "l"],
+                    description="Focus browser address bar",
+                ),
+                DesktopAction(
+                    action_type=ActionType.type_text,
+                    text=target_url,
+                    description=f"Type URL: {target_url}",
+                ),
+                DesktopAction(
+                    action_type=ActionType.press_keys,
+                    keys=["enter"],
+                    description="Navigate to target URL",
+                ),
+                DesktopAction(
+                    action_type=ActionType.wait,
+                    seconds=3.0,
+                    description="Wait for page to load",
+                ),
+                DesktopAction(
+                    action_type=ActionType.verify_state,
+                    expected_text=browser_verify_text,
+                    description=f"Verify {browser} browser window is active",
+                ),
+                DesktopAction(
+                    action_type=ActionType.done,
+                    description=f"Opened {browser} and navigated to {target_url}",
+                ),
+            ]
+
+        if obs.step_index < len(steps):
+            return steps[obs.step_index]
+        return steps[-1]
 
     def _plan_notepad_demo(self, obs: ObservationContext) -> DesktopAction:
         if obs.active_window_rect is not None:

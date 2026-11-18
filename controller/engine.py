@@ -4,19 +4,38 @@ from __future__ import annotations
 
 import os
 import time
+import urllib.parse
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from PIL import Image
 from pydantic import BaseModel
 
-from controller.driver import BaseDesktopDriver, MockDryRunDriver, find_window_rect
+from controller.driver import (
+    BaseDesktopDriver,
+    MockDryRunDriver,
+    _get_foreground_window_title,
+    cleanup_notepads_for_fresh_demo,
+    find_window_rect,
+    get_foreground_window_rect,
+)
 from controller.emergency import EmergencyStopError, SafetyController, SafetyGateError
 from controller.planners import (
     BasePlanner,
+    GeminiPlanner,
     LocalDemoFallbackPlanner,
     ObservationContext,
+    OllamaPlanner,
+    OpenAIPlanner,
+    _extract_song_query,
+    _is_youtube_music_task,
+    annotate_screenshot_for_planner,
+    compute_screenshot_change_ratio,
     create_planner,
+    extract_som_marks,
+    is_browser_or_media_task,
+    locate_youtube_music_play_button,
+    scale_normalized_coord,
 )
 from controller.policy import PolicyDecision, PolicyEngine
 from controller.schema import ActionType, DesktopAction
@@ -45,6 +64,7 @@ class DesktopExecutionEngine:
         policy: Optional[PolicyEngine] = None,
         planner: Optional[BasePlanner] = None,
         backend_name: str = "Local Demo / Fallback",
+        api_key: Optional[str] = None,
         max_retries: int = 3,
         max_steps: int = 30,
         approval_callback: Optional[Callable[[DesktopAction, PolicyDecision], bool]] = None,
@@ -59,8 +79,9 @@ class DesktopExecutionEngine:
         self.safety = safety
         self.store = store
         self.policy = policy or PolicyEngine()
-        self.planner = planner or create_planner(backend_name)
+        self.planner = planner or create_planner(backend_name, api_key=api_key)
         self.backend_name = backend_name
+        self._current_task_text: str = ""
         self.max_retries = max(0, int(max_retries))
         self.max_steps = max(1, int(max_steps))
         self.approval_callback = approval_callback
@@ -94,6 +115,7 @@ class DesktopExecutionEngine:
 
     def _wait_if_paused(self) -> None:
         """Poll briefly while paused/takeover; raise immediately on stop or unauth."""
+        was_paused = bool(self.safety.paused or self.safety.manual_takeover)
         timeout_sec = (
             0.15 if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1" else 300.0
         )
@@ -105,13 +127,25 @@ class DesktopExecutionEngine:
                 break
             time.sleep(0.05)
         self.safety.assert_can_execute()
+        if was_paused:
+            self.driver.restore_last_app_focus()
 
     def _active_window_rect(self) -> Optional[tuple[int, int, int, int]]:
         if isinstance(self.driver, MockDryRunDriver):
-            if any("notepad" in app.lower() for app in self.driver.launched_apps):
+            if self.driver.launched_apps:
                 return (160, 120, 960, 720)
             return None
-        return find_window_rect("Notepad")
+        lower_task = self._current_task_text.lower()
+        if "notepad" in lower_task or "milestone 4" in lower_task:
+            rect = find_window_rect("Notepad")
+            if rect is not None:
+                return rect
+        return get_foreground_window_rect()
+
+    def _active_window_title(self) -> Optional[str]:
+        if isinstance(self.driver, MockDryRunDriver):
+            return self.driver.active_window_text
+        return _get_foreground_window_title()
 
     def _execute_action(self, action: DesktopAction) -> str:
         at = action.action_type
@@ -152,8 +186,24 @@ class DesktopExecutionEngine:
             return f"Approved: {action.reason}"
         return action.description
 
+    def _verify_task_completion(
+        self,
+        task_text: str,
+        history: list[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        if any(
+            entry.get("action_type") == ActionType.verify_state.value
+            and entry.get("status") == "ok"
+            for entry in history
+        ):
+            return True, "Task completion verified"
+        if _is_youtube_music_task(task_text.lower()):
+            return self.driver.verify_state(expected_text=" - YouTube Music")
+        return True, "Task execution completed"
+
     def run_task(self, task_text: str) -> ExecutionResult:
         """Execute a desktop task through Observe-Plan-Validate-Policy-Act-Verify."""
+        self._current_task_text = task_text
         speed_name = self.driver.speed_config.preset.value
         run_id = (
             self.store.start_run(task_text, self.planner.name, speed_name)
@@ -161,11 +211,33 @@ class DesktopExecutionEngine:
             else f"run-{uuid4().hex[:12]}"
         )
 
+        lower_task = task_text.lower()
         is_notepad_demo = (
             isinstance(self.planner, LocalDemoFallbackPlanner)
-            and ("notepad" in task_text.lower() or "milestone 4" in task_text.lower())
+            and ("notepad" in lower_task or "milestone 4" in lower_task)
         )
-        progress_total = 16 if is_notepad_demo else self.max_steps
+        if (
+            is_notepad_demo
+            and not isinstance(self.driver, MockDryRunDriver)
+            and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
+        ):
+            self.policy.approved_workspace.mkdir(parents=True, exist_ok=True)
+            stale_demo = self.policy.approved_workspace / "milestone4_demo.txt"
+            if stale_demo.exists():
+                stale_demo.unlink()
+            cleanup_notepads_for_fresh_demo()
+
+        if isinstance(self.planner, LocalDemoFallbackPlanner):
+            if is_notepad_demo:
+                progress_total = 16
+            elif _is_youtube_music_task(lower_task):
+                progress_total = 10
+            elif is_browser_or_media_task(task_text):
+                progress_total = 8
+            else:
+                progress_total = self.max_steps
+        else:
+            progress_total = self.max_steps
 
         step_index = 0
         steps_executed = 0
@@ -173,6 +245,10 @@ class DesktopExecutionEngine:
         step_retries = 0
         last_error: Optional[str] = None
         history: list[dict[str, Any]] = []
+        executed_sigs: list[tuple[Any, ...]] = []
+        recent_click_coords: list[tuple[int, int]] = []
+        prev_screenshot: Optional[Image.Image] = None
+        screen_changed_last_step: Optional[bool] = None
         last_action_sig: Optional[tuple[Any, ...]] = None
         consecutive_identical = 0
         wall_deadline = time.monotonic() + self.max_wall_seconds
@@ -214,16 +290,84 @@ class DesktopExecutionEngine:
                     self._wait_if_paused()
                     screenshot = self.driver.capture_screenshot()
                     self._emit_screenshot(screenshot)
+
+                    if step_retries == 0 and prev_screenshot is not None and history:
+                        last_entry = history[-1]
+                        if (
+                            isinstance(self.driver, MockDryRunDriver)
+                            or last_entry.get("action_type") in ("wait", "move", "verify_state")
+                        ):
+                            screen_changed_last_step = True
+                        else:
+                            diff_ratio = compute_screenshot_change_ratio(prev_screenshot, screenshot)
+                            screen_changed_last_step = diff_ratio >= 0.002
+                        last_entry["screen_changed"] = screen_changed_last_step
+                        if (
+                            not screen_changed_last_step
+                            and last_entry.get("action_type") in ("click", "double_click", "type_text", "press_keys")
+                        ):
+                            last_error = (
+                                f"Self-correction warning: Previous step ({last_entry.get('action_type')}: "
+                                f"{last_entry.get('description')}) produced NO visible change on the screen. "
+                                "The target element was missed or unfocused. Do NOT repeat the same coordinates "
+                                "or action; try a different coordinate or navigate directly via Ctrl+L."
+                            )
+                    if step_retries == 0:
+                        prev_screenshot = screenshot
+
+                    screen_size = self.driver.get_screen_size()
+                    active_rect = self._active_window_rect()
+                    active_title = self._active_window_title()
+                    detected_ui_hints: dict[str, Any] = {}
+                    navigated_to_yt_search = any(
+                        entry.get("action_type") == "type_text"
+                        and (
+                            "youtube music" in str(entry.get("description", "")).lower()
+                            or "music.youtube.com" in str(entry.get("description", "")).lower()
+                        )
+                        for entry in history
+                    )
+                    if "youtube" in (active_title or "").lower() and navigated_to_yt_search:
+                        px, py = locate_youtube_music_play_button(screenshot, active_rect, screen_size)
+                        detected_ui_hints["youtube_music_play_button_xy"] = [px, py]
+                    if _is_youtube_music_task(lower_task):
+                        detected_ui_hints["direct_search_url_hint"] = (
+                            f"https://music.youtube.com/search?q={urllib.parse.quote_plus(_extract_song_query(task_text))}"
+                        )
+
+                    som_marks = extract_som_marks(screenshot, screen_size)
+
                     obs = ObservationContext(
                         task_text=task_text,
                         step_index=step_index,
-                        screen_size=self.driver.get_screen_size(),
+                        screen_size=screen_size,
                         cursor_pos=self.driver.get_cursor_position(),
-                        active_window_rect=self._active_window_rect(),
+                        active_window_rect=active_rect,
+                        active_window_title=active_title,
+                        screen_changed_last_step=screen_changed_last_step,
+                        som_marks={k: [v[0], v[1]] for k, v in som_marks.items()},
+                        detected_ui_hints=detected_ui_hints,
                         history=list(history),
                         last_error=last_error,
                         approved_workspace=str(self.policy.approved_workspace),
                     )
+                    if (
+                        not isinstance(self.driver, MockDryRunDriver)
+                        and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
+                    ):
+                        try:
+                            preview_img = annotate_screenshot_for_planner(
+                                screenshot,
+                                obs.cursor_pos,
+                                screen_size,
+                                detected_ui_hints=detected_ui_hints,
+                                som_marks=som_marks,
+                            )
+                            if preview_img is not None:
+                                self.policy.approved_workspace.mkdir(parents=True, exist_ok=True)
+                                preview_img.save(self.policy.approved_workspace / "latest_step.png")
+                        except Exception:
+                            pass
                 except (EmergencyStopError, SafetyGateError) as exc:
                     if self.store is not None:
                         self.store.log_action(
@@ -250,6 +394,19 @@ class DesktopExecutionEngine:
                 try:
                     planned = self.planner.plan_next_step(obs, screenshot)
                     action = DesktopAction.model_validate(planned)
+                    if action.mark_id is not None and (action.x is None or action.y is None):
+                        if action.mark_id not in som_marks:
+                            raise ValueError(
+                                f"Unknown mark_id {action.mark_id}; choose a valid visible mark from {sorted(som_marks.keys())}"
+                            )
+                        action.x, action.y = som_marks[action.mark_id]
+                    elif (
+                        isinstance(self.planner, (GeminiPlanner, OpenAIPlanner, OllamaPlanner))
+                        and action.x is not None
+                        and action.y is not None
+                    ):
+                        action.x = scale_normalized_coord(action.x, screen_size[0])
+                        action.y = scale_normalized_coord(action.y, screen_size[1])
                 except Exception as exc:
                     err_msg = f"Planner validation failed: {exc}"
                     if self.store is not None:
@@ -313,15 +470,15 @@ class DesktopExecutionEngine:
                     )
 
                 # Stuck no-op loop guard on new (non-retry) planned actions
+                action_sig = (
+                    action.action_type.value,
+                    action.x,
+                    action.y,
+                    action.text,
+                    tuple(action.keys) if action.keys else None,
+                    action.target_path,
+                )
                 if step_retries == 0 and action.action_type not in (ActionType.done, ActionType.fail):
-                    action_sig = (
-                        action.action_type.value,
-                        action.x,
-                        action.y,
-                        action.text,
-                        tuple(action.keys) if action.keys else None,
-                        action.target_path,
-                    )
                     if action_sig == last_action_sig:
                         consecutive_identical += 1
                     else:
@@ -352,6 +509,63 @@ class DesktopExecutionEngine:
                                 summary=loop_err,
                             )
                         )
+
+                # Multi-step cycle and repeated click-coordinate self-correction guard for AI planners
+                if (
+                    not isinstance(self.planner, LocalDemoFallbackPlanner)
+                    and action.action_type not in (ActionType.done, ActionType.fail)
+                ):
+                    is_repeat_click = False
+                    if (
+                        action.action_type in (ActionType.click, ActionType.double_click)
+                        and action.x is not None
+                        and action.y is not None
+                    ):
+                        near_last_two = sum(
+                            1
+                            for cx, cy in recent_click_coords[-2:]
+                            if abs(cx - action.x) <= 15 and abs(cy - action.y) <= 15
+                        )
+                        is_repeat_click = (near_last_two >= 2) or (
+                            near_last_two >= 1 and screen_changed_last_step is False
+                        )
+
+                    seq = executed_sigs + [action_sig]
+                    is_two_step_cycle = (
+                        len(seq) >= 4
+                        and seq[-4:-2] == seq[-2:]
+                        and seq[-2] != seq[-1]
+                    )
+                    is_three_step_cycle = (
+                        len(seq) >= 6
+                        and seq[-6:-3] == seq[-3:]
+                        and len(set(seq[-3:])) > 1
+                    )
+                    if (is_repeat_click or is_two_step_cycle or is_three_step_cycle) and step_retries < self.max_retries:
+                        coord_note = (
+                            f"clicked ({action.x}, {action.y}) or "
+                            if action.x is not None and action.y is not None
+                            else ""
+                        )
+                        loop_warn = (
+                            f"Loop detected: You already {coord_note}repeated the same action sequence "
+                            "without making progress. Choose a completely different action or navigate "
+                            "directly via press_keys ['ctrl', 'l'] to a search URL."
+                        )
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = loop_warn
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "retry",
+                                error=loop_warn,
+                            )
+                        self._emit_history(action.action_type.value, "retry", loop_warn)
+                        continue
 
                 # 3. Policy & Approval Gate
                 decision = self.policy.evaluate(action)
@@ -468,6 +682,48 @@ class DesktopExecutionEngine:
 
                 # 4. Terminal actions (done / fail)
                 if action.action_type == ActionType.done:
+                    ok_done, done_msg = self._verify_task_completion(task_text, history)
+                    if not ok_done:
+                        history.append(
+                            {
+                                "step_index": step_index,
+                                "action_type": ActionType.verify_state.value,
+                                "description": "Verify task completion before finishing",
+                                "status": "error",
+                                "error": done_msg,
+                            }
+                        )
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                ActionType.verify_state.value,
+                                "Verify task completion before finishing",
+                                "retry" if step_retries < self.max_retries else "failed",
+                                policy_decision=policy_label,
+                                approval_status=approval_status,
+                                error=done_msg,
+                            )
+                        self._emit_history(
+                            ActionType.verify_state.value,
+                            "retry" if step_retries < self.max_retries else "failed",
+                            done_msg,
+                        )
+                        if step_retries < self.max_retries:
+                            step_retries += 1
+                            retries_used += 1
+                            last_error = done_msg
+                            continue
+                        return _complete(
+                            ExecutionResult(
+                                run_id=run_id,
+                                status="failed",
+                                steps_executed=steps_executed,
+                                retries_used=retries_used,
+                                error=done_msg,
+                                summary=f"Task completion verification failed: {done_msg}",
+                            )
+                        )
                     self._emit_progress(progress_total, progress_total, action.description)
                     steps_executed += 1
                     if self.store is not None:
@@ -606,6 +862,23 @@ class DesktopExecutionEngine:
                         err_str,
                     )
                     if step_retries < self.max_retries:
+                        if (
+                            action.action_type == ActionType.verify_state
+                            and _is_youtube_music_task(lower_task)
+                        ):
+                            rx, ry = locate_youtube_music_play_button(
+                                screenshot,
+                                obs.active_window_rect,
+                                obs.screen_size,
+                                retry_index=step_retries + 1,
+                            )
+                            try:
+                                self.driver.click(rx, ry)
+                                self.driver.wait(1.2)
+                            except (EmergencyStopError, SafetyGateError) as stop_exc:
+                                return _stop_step(str(stop_exc))
+                            except Exception:
+                                pass
                         step_retries += 1
                         retries_used += 1
                         last_error = err_str
@@ -625,6 +898,13 @@ class DesktopExecutionEngine:
                 step_retries = 0
                 last_error = None
                 steps_executed += 1
+                executed_sigs.append(action_sig)
+                if (
+                    action.action_type in (ActionType.click, ActionType.double_click)
+                    and action.x is not None
+                    and action.y is not None
+                ):
+                    recent_click_coords.append((int(action.x), int(action.y)))
                 history.append(
                     {
                         "step_index": step_index,

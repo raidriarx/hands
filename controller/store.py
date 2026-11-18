@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-_AIZA_PATTERN = re.compile(r"AIza[0-9A-Za-z_\-]{10,}")
+_AIZA_PATTERN = re.compile(r"(?:AIza|AQ\.)[0-9A-Za-z_\-]{10,}")
 _SK_PATTERN = re.compile(r"sk-[0-9A-Za-z_\-]{10,}")
 _BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[0-9A-Za-z_\-\.=]{8,}")
 _KV_SECRET_PATTERN = re.compile(
