@@ -33,6 +33,7 @@ VALID_STOP_SOURCES: tuple[str, ...] = (
     StopSource.corner_failsafe.value,
 )
 VALID_HOTKEYS: set[str] = {"f12", "ctrl+shift+esc", "ctrl+shift+escape"}
+VALID_PAUSE_HOTKEYS: set[str] = {"esc", "escape"}
 
 
 class SafetyController:
@@ -122,13 +123,22 @@ class SafetyController:
         self.trigger_emergency_stop(StopSource.global_hotkey.value)
         return True
 
+    def simulate_hotkey_escape(self) -> bool:
+        """Pause execution via simulated Esc hotkey unless emergency-stopped."""
+        if not self.emergency_stopped:
+            self.pause()
+        return True
+
     def check_global_hotkey(self, hotkey: str) -> bool:
-        """Trigger global_hotkey emergency stop when F12 or Ctrl+Shift+Esc is pressed."""
+        """Trigger emergency stop for F12 / Ctrl+Shift+Esc or pause for standalone Esc."""
         if not isinstance(hotkey, str):
             return False
         normalized = "+".join(part.strip().lower() for part in hotkey.split("+") if part.strip())
         if normalized in VALID_HOTKEYS:
             self.trigger_emergency_stop(StopSource.global_hotkey.value)
+            return True
+        if normalized in VALID_PAUSE_HOTKEYS:
+            self.simulate_hotkey_escape()
             return True
         return False
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 import types
 from pathlib import Path
 from typing import Optional
@@ -9,6 +12,7 @@ from typing import Optional
 import pytest
 from PIL import Image
 from pydantic import ValidationError
+from PySide6.QtWidgets import QApplication
 
 import controller.driver as driver_mod
 from controller.driver import (
@@ -16,11 +20,12 @@ from controller.driver import (
     MockDryRunDriver,
     reconcile_dpi_coordinates,
 )
-from controller.emergency import EmergencyStopError, SafetyController
+from controller.emergency import SafetyController, SafetyGateError, EmergencyStopError
 from controller.engine import DesktopExecutionEngine
+from controller.gui import DesktopControllerWindow
 from controller.planners import BasePlanner, ObservationContext
 from controller.policy import PolicyEngine
-from controller.schema import ActionType, DesktopAction, SpeedConfig
+from controller.schema import ActionType, DesktopAction, SpeedConfig, SpeedPreset
 from controller.store import SQLiteAuditStore
 
 
@@ -494,3 +499,127 @@ class TestEngineAuditSafetyAndLoops:
         assert runs[0]["status"] == "failed"
         assert "Simulated unexpected screenshot crash" in (runs[0]["error"] or "")
         assert safety.authorized is False
+
+
+class TestEscapePauseAndMidMoveYield:
+    """Verify standalone Esc pauses mid-move, resumes in engine, and binds in Window B."""
+
+    def test_esc_mid_move_stops_cursor_immediately_without_emergency_stop(self) -> None:
+        safety = SafetyController()
+        safety.authorize_start()
+
+        def _esc_mid_move(_pt: tuple[int, int], idx: int, _total: int) -> None:
+            if idx == 5:
+                safety.simulate_hotkey_escape()
+
+        driver = MockDryRunDriver(
+            safety=safety,
+            initial_cursor=(100, 100),
+            step_callback=_esc_mid_move,
+        )
+
+        with pytest.raises(SafetyGateError):
+            driver.move_to(1000, 600, speed_config=SpeedConfig.from_preset(SpeedPreset.Normal))
+
+        assert driver.cursor_pos != (1000, 600)
+        assert safety.paused is True
+        assert safety.emergency_stopped is False
+
+    def test_engine_pauses_mid_move_on_esc_and_resumes_cleanly(self, tmp_path: Path) -> None:
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        store = SQLiteAuditStore(tmp_path / "pause_resume.db")
+
+        triggered = {"done": False}
+        history_events: list[tuple[str, str, str]] = []
+
+        def _esc_once(_pt: tuple[int, int], idx: int, _total: int) -> None:
+            if not triggered["done"] and idx == 4:
+                triggered["done"] = True
+                safety.simulate_hotkey_escape()
+
+                def _resume_soon() -> None:
+                    time.sleep(0.03)
+                    safety.resume()
+
+                threading.Thread(target=_resume_soon, daemon=True).start()
+
+        driver = MockDryRunDriver(
+            safety=safety,
+            initial_cursor=(100, 100),
+            step_callback=_esc_once,
+        )
+
+        def _plan(obs: ObservationContext) -> DesktopAction:
+            if obs.step_index == 0:
+                return DesktopAction(
+                    action_type=ActionType.move,
+                    x=1000,
+                    y=600,
+                    description="Move cursor across screen",
+                )
+            return DesktopAction(action_type=ActionType.done, description="Completed after resume")
+
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=_CallbackPlanner(_plan),
+            history_callback=lambda a, s, d: history_events.append((a, s, d)),
+        )
+        res = engine.run_task("Pause mid-move on Esc and resume")
+        assert res.status == "completed"
+        assert res.retries_used == 0
+        assert driver.cursor_pos == (1000, 600)
+        assert any(a == "pause" and s == "paused" for a, s, _ in history_events)
+        actions = store.get_actions_for_run(res.run_id)
+        assert any(row["action_type"] == "pause" and row["status"] == "paused" for row in actions)
+
+    def test_window_b_has_esc_shortcut_that_pauses_without_estop(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        app = QApplication.instance() or QApplication([])
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+
+        assert hasattr(win, "esc_shortcut")
+        assert win.pause_button.text() == "Pause (Esc)"
+
+        win.start_button.click()
+        assert safety.authorized is True
+        win._on_esc_shortcut()
+        assert safety.paused is True
+        assert safety.emergency_stopped is False
+
+        win.close()
+        app.processEvents()
+
+    def test_live_driver_press_keys_suppresses_esc_self_pause(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = LiveWindowsDesktopDriver(safety=safety)
+        monkeypatch.setattr(driver, "_poll_hotkeys_and_safety", lambda *a, **k: None)
+
+        seen_suppress: list[bool] = []
+
+        class _FakePyAutoGUI:
+            class FailSafeException(Exception):
+                pass
+
+            def press(self, key: str, _pause: bool = False) -> None:
+                seen_suppress.append(driver._suppress_esc_pause)
+                assert key == "esc"
+
+        driver._pyautogui = _FakePyAutoGUI()  # type: ignore[assignment]
+        driver.press_keys(["Esc"])
+        assert seen_suppress == [True]
+        assert driver._suppress_esc_pause is False
+        assert safety.paused is False

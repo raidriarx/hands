@@ -524,6 +524,7 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.0
         self._pyautogui = pyautogui
+        self._suppress_esc_pause: bool = False
 
     def _poll_global_hotkeys(self) -> None:
         if os.name != "nt":
@@ -535,6 +536,8 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         esc_down = bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
         if f12_down or (ctrl_down and shift_down and esc_down):
             self.safety.trigger_emergency_stop(StopSource.global_hotkey.value)
+        elif esc_down and not ctrl_down and not shift_down and not self._suppress_esc_pause:
+            self.safety.pause()
 
     def _poll_hotkeys_and_safety(
         self,
@@ -616,6 +619,7 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during click") from exc
         if cfg.post_action_delay_sec > 0:
+            self._poll_hotkeys_and_safety(x, y, sw, sh)
             time.sleep(cfg.post_action_delay_sec)
 
     def type_text(self, text: str, interval: float = 0.02) -> None:
@@ -637,6 +641,11 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
     def press_keys(self, keys: list[str]) -> None:
         self._poll_hotkeys_and_safety()
         normalized = [k.strip().lower() for k in keys if k.strip()]
+        has_ctrl = any(k in {"ctrl", "control"} for k in normalized)
+        has_shift = "shift" in normalized
+        sends_esc = any(k in {"esc", "escape"} for k in normalized) and not (has_ctrl and has_shift)
+        if sends_esc:
+            self._suppress_esc_pause = True
         try:
             if len(normalized) == 1:
                 self._pyautogui.press(normalized[0], _pause=False)
@@ -645,7 +654,11 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         except self._pyautogui.FailSafeException as exc:
             self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during press_keys") from exc
+        finally:
+            if sends_esc:
+                self._suppress_esc_pause = False
         if self.speed_config.post_action_delay_sec > 0:
+            self._poll_hotkeys_and_safety()
             time.sleep(self.speed_config.post_action_delay_sec)
 
     def scroll(self, clicks: int) -> None:

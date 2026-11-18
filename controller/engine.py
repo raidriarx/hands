@@ -523,9 +523,8 @@ class DesktopExecutionEngine:
                     progress_total,
                     action.description,
                 )
-                try:
-                    verification_msg = self._execute_action(action)
-                except (EmergencyStopError, SafetyGateError) as exc:
+
+                def _stop_step(error_msg: str) -> ExecutionResult:
                     if self.store is not None:
                         self.store.log_action(
                             run_id,
@@ -535,19 +534,50 @@ class DesktopExecutionEngine:
                             "stopped",
                             policy_decision=policy_label,
                             approval_status=approval_status,
-                            error=str(exc),
+                            error=error_msg,
                         )
-                    self._emit_history(action.action_type.value, "stopped", str(exc))
+                    self._emit_history(action.action_type.value, "stopped", error_msg)
                     return _complete(
                         ExecutionResult(
                             run_id=run_id,
                             status="stopped",
                             steps_executed=steps_executed,
                             retries_used=retries_used,
-                            error=str(exc),
-                            summary=f"Execution stopped: {exc}",
+                            error=error_msg,
+                            summary=f"Execution stopped: {error_msg}",
                         )
                     )
+
+                try:
+                    verification_msg = self._execute_action(action)
+                except EmergencyStopError as exc:
+                    return _stop_step(str(exc))
+                except SafetyGateError as exc:
+                    if (
+                        (self.safety.paused or self.safety.manual_takeover)
+                        and not self.safety.emergency_stopped
+                        and self.safety.authorized
+                    ):
+                        pause_msg = "Execution paused (Esc / Pause); waiting for Resume"
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                "pause",
+                                action.description,
+                                "paused",
+                                policy_decision=policy_label,
+                                approval_status=approval_status,
+                                error=str(exc),
+                            )
+                        self._emit_history("pause", "paused", pause_msg)
+                        try:
+                            self._wait_if_paused()
+                        except (EmergencyStopError, SafetyGateError) as wait_exc:
+                            return _stop_step(str(wait_exc))
+                        if self.safety.can_execute():
+                            continue
+                    return _stop_step(str(exc))
                 except (RuntimeError, OSError, ValueError) as exc:
                     err_str = str(exc)
                     history.append(

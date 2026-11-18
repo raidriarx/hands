@@ -259,6 +259,35 @@ class TestSafetyControllerAndTripleEmergencyStop:
         assert safety.check_global_hotkey("Ctrl+C") is False
         assert safety.emergency_stopped is False
 
+    def test_escape_hotkey_pauses_without_emergency_stop(self) -> None:
+        safety = SafetyController()
+        safety.authorize_start()
+
+        assert safety.simulate_hotkey_escape() is True
+        assert safety.paused is True
+        assert safety.emergency_stopped is False
+        assert safety.stop_source is None
+        assert safety.can_execute() is False
+
+        safety.resume()
+        assert safety.paused is False
+        assert safety.can_execute() is True
+
+        assert safety.check_global_hotkey("Esc") is True
+        assert safety.paused is True
+        assert safety.emergency_stopped is False
+
+        safety.resume()
+        assert safety.check_global_hotkey("Escape") is True
+        assert safety.paused is True
+        assert safety.emergency_stopped is False
+
+        # Ctrl+Shift+Esc remains a full emergency stop
+        safety.resume()
+        assert safety.check_global_hotkey("Ctrl+Shift+Esc") is True
+        assert safety.emergency_stopped is True
+        assert safety.stop_source == StopSource.global_hotkey.value
+
     @pytest.mark.parametrize(
         "x,y",
         [

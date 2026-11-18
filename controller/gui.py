@@ -190,13 +190,16 @@ class DesktopControllerWindow(QMainWindow):
         root_layout.addWidget(task_group)
 
         # Safety & Control Bar
-        safety_group = QGroupBox("Safety Gate & Operator Controls (F12 / Ctrl+Shift+Esc)", self)
+        safety_group = QGroupBox(
+            "Safety Gate & Operator Controls (Pause: Esc | E-Stop: F12 / Ctrl+Shift+Esc)",
+            self,
+        )
         safety_layout = QVBoxLayout(safety_group)
 
         btn_row = QHBoxLayout()
         self.start_button = QPushButton("Start / Authorize", self)
         self.start_button.setStyleSheet("background-color: #1f7a3e; color: white; font-weight: bold; padding: 6px 12px;")
-        self.pause_button = QPushButton("Pause", self)
+        self.pause_button = QPushButton("Pause (Esc)", self)
         self.resume_button = QPushButton("Resume", self)
         self.takeover_button = QPushButton("Manual Takeover", self)
         self.emergency_stop_button = QPushButton("EMERGENCY STOP", self)
@@ -306,6 +309,10 @@ class DesktopControllerWindow(QMainWindow):
         self.f12_shortcut = QShortcut(QKeySequence("F12"), self)
         self.f12_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.f12_shortcut.activated.connect(self._on_f12_shortcut)
+
+        self.esc_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self.esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.esc_shortcut.activated.connect(self._on_esc_shortcut)
 
         self._poll_timer: Optional[QTimer] = None
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
@@ -514,6 +521,11 @@ class DesktopControllerWindow(QMainWindow):
                     self._trigger_stop(StopSource.global_hotkey.value)
                 return
 
+            if esc_down and not ctrl_down and not shift_down:
+                if self.safety.authorized and not self.safety.paused and not self.safety.emergency_stopped:
+                    self.on_pause_clicked()
+                return
+
             if self.safety.can_execute():
                 x, y = self.driver.get_cursor_position()
                 w, h = self.driver.get_screen_size()
@@ -524,6 +536,10 @@ class DesktopControllerWindow(QMainWindow):
 
     def _on_f12_shortcut(self) -> None:
         self._trigger_stop(StopSource.global_hotkey.value)
+
+    def _on_esc_shortcut(self) -> None:
+        if not self.safety.paused and not self.safety.emergency_stopped:
+            self.on_pause_clicked()
 
     def _trigger_stop(self, source: str) -> None:
         self.safety.trigger_emergency_stop(source)
