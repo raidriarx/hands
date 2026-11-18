@@ -1,4 +1,4 @@
-"""Entry point for Window B — Autonomous Windows Desktop Controller."""
+"""Entry point for Window B - Autonomous Windows Desktop Controller."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from controller.schema import SpeedConfig
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser for Window B."""
     parser = argparse.ArgumentParser(
-        description="Window B — Autonomous Windows Desktop Controller"
+        description="Window B - Autonomous Windows Desktop Controller"
     )
     parser.add_argument(
         "--live-demo-notepad",
@@ -47,6 +47,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Instantiate Window B, capture a preview screenshot, and exit cleanly.",
     )
+    parser.add_argument(
+        "--fresh-demo",
+        action="store_true",
+        help="Remove stale approved_workspace/milestone4_demo.txt before starting.",
+    )
     return parser
 
 
@@ -56,7 +61,7 @@ def _create_optional_store() -> Optional[Any]:
         from controller.store import SQLiteAuditStore
     except ImportError:
         return None
-    db_path = Path(__file__).resolve().parent / "approved_workspace" / "audit.db"
+    db_path = Path(__file__).resolve().parent / "controller_history.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return SQLiteAuditStore(db_path)
 
@@ -82,6 +87,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     task_text = args.task.strip()
     if args.live_demo_notepad and not task_text:
         task_text = MILESTONE_4_PRESET
+
+    if args.fresh_demo or (args.live_demo_notepad and not args.headless_check):
+        stale_demo = Path(__file__).resolve().parent / "approved_workspace" / "milestone4_demo.txt"
+        if stale_demo.exists():
+            stale_demo.unlink()
 
     window = DesktopControllerWindow(
         safety=safety,

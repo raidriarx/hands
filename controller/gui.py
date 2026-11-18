@@ -74,6 +74,11 @@ class DesktopControllerWindow(QMainWindow):
     approval_resolved = Signal(bool)
     emergency_stopped = Signal(str)
     _history_signal = Signal(str, str, str)
+    _progress_signal = Signal(int, int, str)
+    _screenshot_signal = Signal(object)
+    _status_signal = Signal(str)
+    _completion_signal = Signal(str, str)
+    _approval_signal = Signal(str, str, str)
 
     def __init__(
         self,
@@ -99,7 +104,7 @@ class DesktopControllerWindow(QMainWindow):
         self._last_pixmap: Optional[QPixmap] = None
         self._engine_thread: Optional[threading.Thread] = None
 
-        self.setWindowTitle("Window B — Autonomous Windows Desktop Controller")
+        self.setWindowTitle("Window B - Autonomous Windows Desktop Controller")
         self.setGeometry(970, 40, 920, 960)
 
         self._build_ui()
@@ -291,6 +296,11 @@ class DesktopControllerWindow(QMainWindow):
         self.approve_button.clicked.connect(self.on_approve_clicked)
         self.deny_button.clicked.connect(self.on_deny_clicked)
         self._history_signal.connect(self.append_history_row)
+        self._progress_signal.connect(self.set_progress)
+        self._screenshot_signal.connect(self.update_screenshot)
+        self._status_signal.connect(self._on_status_signal)
+        self._completion_signal.connect(self._on_completion_signal)
+        self._approval_signal.connect(self.request_user_approval)
 
     def _setup_shortcuts_and_polling(self) -> None:
         self.f12_shortcut = QShortcut(QKeySequence("F12"), self)
@@ -550,13 +560,50 @@ class DesktopControllerWindow(QMainWindow):
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
             self._try_launch_engine(task_text, backend_name)
 
+    def _on_status_signal(self, status_text: str) -> None:
+        self.status_label.setText(status_text)
+
+    def _on_completion_signal(self, status: str, summary: str) -> None:
+        self.append_history_row("engine", status, summary)
+        self.status_label.setText(f"Task {status.capitalize()}")
+        if summary:
+            self.current_action_label.setText(summary[:80])
+        if status == "completed":
+            self.progress_bar.setValue(self.progress_bar.maximum())
+
     def _try_launch_engine(self, task_text: str, backend_name: str) -> None:
         if self._engine_thread is not None and self._engine_thread.is_alive():
             return
         try:
-            from controller.engine import DesktopExecutionEngine
+            from controller.engine import DesktopExecutionEngine, ExecutionResult
+            from controller.policy import PolicyDecision
+            from controller.schema import DesktopAction
         except ImportError:
             return
+
+        def _on_progress(current: int, total: int, action_text: str) -> None:
+            self._progress_signal.emit(current, total, action_text)
+
+        def _on_screenshot(image: Image.Image) -> None:
+            self._screenshot_signal.emit(image)
+
+        def _on_history(action_type: str, status: str, detail: str) -> None:
+            self._history_signal.emit(action_type, status, detail)
+
+        def _on_approval(action: DesktopAction, decision: PolicyDecision) -> bool:
+            self._approval_event.clear()
+            self._approval_signal.emit(
+                decision.reason,
+                decision.risk_category,
+                action.description,
+            )
+            return self.wait_for_approval_decision()
+
+        def _on_completion(result: ExecutionResult) -> None:
+            self._completion_signal.emit(
+                result.status,
+                result.summary or result.error or "",
+            )
 
         def _worker() -> None:
             try:
@@ -565,10 +612,16 @@ class DesktopControllerWindow(QMainWindow):
                     safety=self.safety,
                     store=self.store,
                     backend_name=backend_name,
+                    approval_callback=_on_approval,
+                    progress_callback=_on_progress,
+                    screenshot_callback=_on_screenshot,
+                    history_callback=_on_history,
+                    completion_callback=_on_completion,
                 )
                 engine.run_task(task_text)
             except Exception as exc:
                 self._history_signal.emit("engine", "error", str(exc))
+                self._status_signal.emit(f"Engine Error: {exc}")
 
         self._engine_thread = threading.Thread(target=_worker, daemon=True)
         self._engine_thread.start()
