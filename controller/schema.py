@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, model_validator
+
+MAX_WAIT_SECONDS = 300.0
+MAX_TEXT_LENGTH = 10000
+MAX_SCROLL_CLICKS = 100
+MAX_KEY_LENGTH = 32
+MAX_MOVE_DURATION_SEC = 30.0
+MAX_PIXELS_PER_SECOND = 20000.0
+MAX_POST_ACTION_DELAY_SEC = 30.0
+MAX_INTERPOLATION_STEPS = 500
 
 
 class ActionType(str, Enum):
@@ -70,6 +80,25 @@ class DesktopAction(BaseModel):
         if (self.x is None) != (self.y is None):
             raise ValueError("both x and y coordinates must be provided together")
 
+        if self.text is not None and len(self.text) > MAX_TEXT_LENGTH:
+            raise ValueError(f"text length must not exceed {MAX_TEXT_LENGTH} characters")
+
+        if self.clicks is not None and abs(self.clicks) > MAX_SCROLL_CLICKS:
+            raise ValueError(f"scroll clicks magnitude must not exceed {MAX_SCROLL_CLICKS}")
+
+        if self.seconds is not None:
+            if not math.isfinite(self.seconds) or self.seconds < 0 or self.seconds > MAX_WAIT_SECONDS:
+                raise ValueError(f"seconds must be finite and within [0, {MAX_WAIT_SECONDS}]")
+
+        if self.keys is not None:
+            for key in self.keys:
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError("keys entries must be non-empty strings")
+                if len(key) > MAX_KEY_LENGTH:
+                    raise ValueError(f"key entry {key!r} exceeds maximum length of {MAX_KEY_LENGTH}")
+                if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+                    raise ValueError("keys entries must not contain control characters or newlines")
+
         at = self.action_type
         if at in (ActionType.click, ActionType.double_click, ActionType.move):
             if self.x is None or self.y is None:
@@ -78,14 +107,14 @@ class DesktopAction(BaseModel):
             if self.text is None or len(self.text) == 0:
                 raise ValueError("type_text requires a non-empty text string")
         elif at == ActionType.press_keys:
-            if not self.keys or not all(isinstance(k, str) and k.strip() for k in self.keys):
+            if not self.keys:
                 raise ValueError("press_keys requires a non-empty list of non-empty key strings")
         elif at == ActionType.scroll:
             if self.clicks is None or self.clicks == 0:
                 raise ValueError("scroll requires a non-zero clicks integer")
         elif at == ActionType.wait:
-            if self.seconds is None or self.seconds < 0:
-                raise ValueError("wait requires non-negative seconds")
+            if self.seconds is None:
+                raise ValueError("wait requires finite non-negative seconds")
         elif at == ActionType.launch_app:
             if self.app_name is None or not self.app_name.strip():
                 raise ValueError("launch_app requires a non-empty app_name")
@@ -134,14 +163,34 @@ class SpeedConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_timings(self) -> SpeedConfig:
-        if self.move_duration_sec <= 0:
-            raise ValueError("move_duration_sec must be greater than 0")
-        if self.pixels_per_second <= 0:
-            raise ValueError("pixels_per_second must be greater than 0")
-        if self.post_action_delay_sec < 0:
-            raise ValueError("post_action_delay_sec must be non-negative")
-        if self.interpolation_steps < 1:
-            raise ValueError("interpolation_steps must be at least 1")
+        if (
+            not math.isfinite(self.move_duration_sec)
+            or self.move_duration_sec <= 0
+            or self.move_duration_sec > MAX_MOVE_DURATION_SEC
+        ):
+            raise ValueError(
+                f"move_duration_sec must be finite and within (0, {MAX_MOVE_DURATION_SEC}]"
+            )
+        if (
+            not math.isfinite(self.pixels_per_second)
+            or self.pixels_per_second <= 0
+            or self.pixels_per_second > MAX_PIXELS_PER_SECOND
+        ):
+            raise ValueError(
+                f"pixels_per_second must be finite and within (0, {MAX_PIXELS_PER_SECOND}]"
+            )
+        if (
+            not math.isfinite(self.post_action_delay_sec)
+            or self.post_action_delay_sec < 0
+            or self.post_action_delay_sec > MAX_POST_ACTION_DELAY_SEC
+        ):
+            raise ValueError(
+                f"post_action_delay_sec must be finite and within [0, {MAX_POST_ACTION_DELAY_SEC}]"
+            )
+        if self.interpolation_steps < 1 or self.interpolation_steps > MAX_INTERPOLATION_STEPS:
+            raise ValueError(
+                f"interpolation_steps must be within [1, {MAX_INTERPOLATION_STEPS}]"
+            )
         return self
 
     @classmethod

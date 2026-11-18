@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import subprocess
 import time
@@ -46,6 +47,30 @@ def compute_smooth_path(
     return path
 
 
+def reconcile_dpi_coordinates(
+    x: int,
+    y: int,
+    source_scale: float = 1.0,
+    target_scale: float = 1.0,
+    screen_size: tuple[int, int] = (1920, 1080),
+) -> tuple[int, int]:
+    """Scale coordinates across DPI ratios and clamp within [0, width-1] x [0, height-1]."""
+    if not math.isfinite(source_scale) or source_scale <= 0:
+        raise ValueError("source_scale must be finite and positive")
+    if not math.isfinite(target_scale) or target_scale <= 0:
+        raise ValueError("target_scale must be finite and positive")
+    width, height = int(screen_size[0]), int(screen_size[1])
+    if width <= 0 or height <= 0:
+        raise ValueError("screen_size width and height must be positive")
+
+    ratio = target_scale / source_scale
+    scaled_x = int(round(x * ratio))
+    scaled_y = int(round(y * ratio))
+    clamped_x = max(0, min(width - 1, scaled_x))
+    clamped_y = max(0, min(height - 1, scaled_y))
+    return clamped_x, clamped_y
+
+
 def find_window_rect(title_substring: str) -> Optional[tuple[int, int, int, int]]:
     """Find the bounding rectangle (left, top, right, bottom) of a visible window."""
     if os.name != "nt" or not title_substring.strip():
@@ -84,14 +109,18 @@ def find_window_rect(title_substring: str) -> Optional[tuple[int, int, int, int]
     return matched_rect[0] if matched_rect else None
 
 
-def _focus_window_by_title(title_substring: str) -> Optional[tuple[int, int, int, int]]:
-    """Attempt to focus a visible Win32 window matching title_substring and return its rect."""
+def _focus_window_by_title(
+    title_substring: str,
+    target_pid: Optional[int] = None,
+    retries: int = 5,
+) -> tuple[Optional[tuple[int, int, int, int]], bool]:
+    """Focus a visible Win32 window matching target_pid/title_substring and confirm foreground."""
     if os.name != "nt" or not title_substring.strip():
-        return None
+        return None, False
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
     needle = title_substring.lower()
-    matched: list[tuple[int, tuple[int, int, int, int]]] = []
 
     class RECT(ctypes.Structure):
         _fields_ = [
@@ -102,33 +131,99 @@ def _focus_window_by_title(title_substring: str) -> Optional[tuple[int, int, int
         ]
 
     enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    last_bounds: Optional[tuple[int, int, int, int]] = None
 
-    def _callback(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        if needle in buf.value.lower():
+    for attempt in range(max(1, retries)):
+        pid_matches: list[tuple[int, tuple[int, int, int, int]]] = []
+        title_matches: list[tuple[int, tuple[int, int, int, int]]] = []
+
+        def _callback(hwnd: int, _lparam: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            win_pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+            length = user32.GetWindowTextLengthW(hwnd)
+            title_val = ""
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title_val = buf.value
+
             rect = RECT()
-            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                matched.append((hwnd, (rect.left, rect.top, rect.right, rect.bottom)))
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            bounds = (rect.left, rect.top, rect.right, rect.bottom)
+
+            if target_pid is not None and win_pid.value == target_pid and title_val:
+                pid_matches.append((hwnd, bounds))
                 return False
-        return True
+            if title_val and needle in title_val.lower():
+                title_matches.append((hwnd, bounds))
+            return True
 
-    user32.EnumWindows(enum_proc_type(_callback), 0)
-    if not matched:
+        user32.EnumWindows(enum_proc_type(_callback), 0)
+        chosen = pid_matches[0] if pid_matches else (title_matches[0] if title_matches else None)
+        if chosen is None:
+            if attempt + 1 < retries:
+                time.sleep(0.1)
+            continue
+
+        hwnd, bounds = chosen
+        last_bounds = bounds
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            fg_hwnd = user32.GetForegroundWindow()
+            if fg_hwnd != hwnd:
+                cur_tid = kernel32.GetCurrentThreadId()
+                fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+                target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+                attached_fg = False
+                attached_target = False
+                try:
+                    if fg_tid and fg_tid != cur_tid:
+                        attached_fg = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+                    if target_tid and target_tid != cur_tid and target_tid != fg_tid:
+                        attached_target = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                finally:
+                    if attached_target:
+                        user32.AttachThreadInput(cur_tid, target_tid, False)
+                    if attached_fg:
+                        user32.AttachThreadInput(cur_tid, fg_tid, False)
+
+            fg_after = user32.GetForegroundWindow()
+            if fg_after == hwnd:
+                return bounds, True
+            if target_pid is not None and fg_after:
+                fg_pid = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(fg_after, ctypes.byref(fg_pid))
+                if fg_pid.value == target_pid:
+                    return bounds, True
+        except Exception:
+            pass
+
+        if attempt + 1 < retries:
+            time.sleep(0.1)
+
+    return last_bounds, False
+
+
+def _get_foreground_window_title() -> Optional[str]:
+    """Return the title of the current active foreground window on Windows."""
+    if os.name != "nt":
         return None
-
-    hwnd, bounds = matched[0]
-    try:
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-    return bounds
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return None
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value or None
 
 
 def _list_visible_window_titles() -> list[str]:
@@ -375,6 +470,7 @@ class MockDryRunDriver(BaseDesktopDriver):
             "args": list(args or []),
             "pid": 1000 + len(self.launched_apps),
             "rect": (160, 120, 960, 720),
+            "focus_confirmed": True,
             "mock": True,
         }
         self.action_history.append({"action": "launch_app", **info})
@@ -418,6 +514,11 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         speed_config: Optional[SpeedConfig] = None,
     ) -> None:
         super().__init__(safety=safety, speed_config=speed_config)
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
         import pyautogui
 
         pyautogui.FAILSAFE = True
@@ -483,6 +584,8 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         step_delay = cfg.move_duration_sec / max(len(path), 1)
         try:
             for px, py in path:
+                actual_x, actual_y = self.get_cursor_position()
+                self._poll_hotkeys_and_safety(actual_x, actual_y, sw, sh)
                 self._poll_hotkeys_and_safety(px, py, sw, sh)
                 self._pyautogui.moveTo(px, py, duration=0, _pause=False)
                 if step_delay > 0:
@@ -517,12 +620,18 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
 
     def type_text(self, text: str, interval: float = 0.02) -> None:
         self._poll_hotkeys_and_safety()
+        step_interval = max(0.0, float(interval))
         try:
-            self._pyautogui.write(text, interval=interval, _pause=False)
+            for ch in text:
+                self._poll_hotkeys_and_safety()
+                self._pyautogui.write(ch, interval=0, _pause=False)
+                if step_interval > 0:
+                    time.sleep(step_interval)
         except self._pyautogui.FailSafeException as exc:
             self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during type_text") from exc
         if self.speed_config.post_action_delay_sec > 0:
+            self._poll_hotkeys_and_safety()
             time.sleep(self.speed_config.post_action_delay_sec)
 
     def press_keys(self, keys: list[str]) -> None:
@@ -548,7 +657,10 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during scroll") from exc
 
     def wait(self, seconds: float) -> None:
-        deadline = time.monotonic() + max(seconds, 0.0)
+        if not math.isfinite(seconds):
+            raise ValueError("wait duration must be finite")
+        clamped = min(max(float(seconds), 0.0), 300.0)
+        deadline = time.monotonic() + clamped
         while True:
             self._poll_hotkeys_and_safety()
             remaining = deadline - time.monotonic()
@@ -566,12 +678,15 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         proc = subprocess.Popen(cmd, shell=False)
         time.sleep(0.5)
         stem = Path(app_name).stem
-        rect = _focus_window_by_title(stem) or find_window_rect(stem)
+        rect, focus_confirmed = _focus_window_by_title(stem, target_pid=proc.pid)
+        if rect is None:
+            rect = find_window_rect(stem)
         return {
             "app_name": app_name,
             "args": list(args or []),
             "pid": proc.pid,
             "rect": rect,
+            "focus_confirmed": focus_confirmed,
             "mock": False,
         }
 
@@ -591,9 +706,12 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             return True, f"Verified file on disk: {target_path}"
 
         if expected_text:
+            fg_title = _get_foreground_window_title()
+            if fg_title and expected_text.lower() in fg_title.lower():
+                return True, f"Verified active foreground window title containing {expected_text!r}"
             titles = _list_visible_window_titles()
             if any(expected_text.lower() in title.lower() for title in titles):
-                return True, f"Verified window title containing {expected_text!r}"
+                return True, f"Verified visible window title containing {expected_text!r}"
             return False, f"No visible window title matched {expected_text!r}"
 
         return False, "verify_state requires target_path or expected_text"

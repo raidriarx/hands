@@ -52,6 +52,8 @@ class DesktopExecutionEngine:
         screenshot_callback: Optional[Callable[[Image.Image], None]] = None,
         history_callback: Optional[Callable[[str, str, str], None]] = None,
         completion_callback: Optional[Callable[[ExecutionResult], None]] = None,
+        max_no_op_repeats: int = 5,
+        max_wall_seconds: float = 300.0,
     ) -> None:
         self.driver = driver
         self.safety = safety
@@ -66,6 +68,8 @@ class DesktopExecutionEngine:
         self.screenshot_callback = screenshot_callback
         self.history_callback = history_callback
         self.completion_callback = completion_callback
+        self.max_no_op_repeats = max(0, int(max_no_op_repeats))
+        self.max_wall_seconds = max(0.01, float(max_wall_seconds))
 
     def _emit_history(self, action_type: str, status: str, detail: str) -> None:
         if self.history_callback is not None:
@@ -82,6 +86,8 @@ class DesktopExecutionEngine:
     def _finish_and_emit(self, result: ExecutionResult) -> ExecutionResult:
         if self.store is not None:
             self.store.finish_run(result.run_id, result.status, error=result.error)
+        if not self.safety.emergency_stopped:
+            self.safety.revoke_authorization()
         if self.completion_callback is not None:
             self.completion_callback(result)
         return result
@@ -167,288 +173,471 @@ class DesktopExecutionEngine:
         step_retries = 0
         last_error: Optional[str] = None
         history: list[dict[str, Any]] = []
+        last_action_sig: Optional[tuple[Any, ...]] = None
+        consecutive_identical = 0
+        wall_deadline = time.monotonic() + self.max_wall_seconds
+        run_finished = False
+        unexpected_error: Optional[str] = None
 
-        while step_index < self.max_steps:
-            # 1. Observe & Safety Gate
-            try:
-                self._wait_if_paused()
-                screenshot = self.driver.capture_screenshot()
-                self._emit_screenshot(screenshot)
-                obs = ObservationContext(
-                    task_text=task_text,
-                    step_index=step_index,
-                    screen_size=self.driver.get_screen_size(),
-                    cursor_pos=self.driver.get_cursor_position(),
-                    active_window_rect=self._active_window_rect(),
-                    history=list(history),
-                    last_error=last_error,
-                    approved_workspace=str(self.policy.approved_workspace),
-                )
-            except (EmergencyStopError, SafetyGateError) as exc:
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        "safety_gate",
-                        "Observe safety gate check",
-                        "stopped",
-                        error=str(exc),
-                    )
-                self._emit_history("safety_gate", "stopped", str(exc))
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="stopped",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=str(exc),
-                        summary=f"Execution halted by safety gate: {exc}",
-                    )
-                )
+        def _complete(result: ExecutionResult) -> ExecutionResult:
+            nonlocal run_finished
+            run_finished = True
+            return self._finish_and_emit(result)
 
-            # 2. Plan & Validate
-            try:
-                planned = self.planner.plan_next_step(obs, screenshot)
-                action = DesktopAction.model_validate(planned)
-            except Exception as exc:
-                err_msg = f"Planner validation failed: {exc}"
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        "plan",
-                        "Plan next desktop action",
-                        "failed",
-                        error=err_msg,
+        try:
+            while step_index < self.max_steps:
+                if time.monotonic() >= wall_deadline:
+                    wall_err = f"Exceeded max_wall_seconds ({self.max_wall_seconds}s) without completing task"
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            "timeout",
+                            "Wall-clock deadline exceeded",
+                            "failed",
+                            error=wall_err,
+                        )
+                    self._emit_history("timeout", "failed", wall_err)
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="failed",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=wall_err,
+                            summary=wall_err,
+                        )
                     )
-                self._emit_history("plan", "failed", err_msg)
-                if step_retries < self.max_retries:
-                    step_retries += 1
-                    retries_used += 1
-                    last_error = err_msg
-                    continue
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="failed",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=err_msg,
-                        summary=err_msg,
-                    )
-                )
 
-            # 3. Policy & Approval Gate
-            decision = self.policy.evaluate(action)
-            if not decision.allowed:
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
+                # 1. Observe & Safety Gate
+                try:
+                    self._wait_if_paused()
+                    screenshot = self.driver.capture_screenshot()
+                    self._emit_screenshot(screenshot)
+                    obs = ObservationContext(
+                        task_text=task_text,
+                        step_index=step_index,
+                        screen_size=self.driver.get_screen_size(),
+                        cursor_pos=self.driver.get_cursor_position(),
+                        active_window_rect=self._active_window_rect(),
+                        history=list(history),
+                        last_error=last_error,
+                        approved_workspace=str(self.policy.approved_workspace),
+                    )
+                except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            "safety_gate",
+                            "Observe safety gate check",
+                            "stopped",
+                            error=str(exc),
+                        )
+                    self._emit_history("safety_gate", "stopped", str(exc))
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="stopped",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=str(exc),
+                            summary=f"Execution halted by safety gate: {exc}",
+                        )
+                    )
+
+                # 2. Plan & Validate
+                try:
+                    planned = self.planner.plan_next_step(obs, screenshot)
+                    action = DesktopAction.model_validate(planned)
+                except Exception as exc:
+                    err_msg = f"Planner validation failed: {exc}"
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            "plan",
+                            "Plan next desktop action",
+                            "failed",
+                            error=err_msg,
+                        )
+                    self._emit_history("plan", "failed", err_msg)
+                    history.append(
+                        {
+                            "step_index": step_index,
+                            "action_type": "plan",
+                            "description": "Plan next desktop action",
+                            "status": "error",
+                            "error": err_msg,
+                        }
+                    )
+                    if step_retries < self.max_retries:
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = err_msg
+                        continue
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="failed",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=err_msg,
+                            summary=err_msg,
+                        )
+                    )
+
+                # Re-check safety gate after potentially slow planning step
+                try:
+                    self.safety.assert_can_execute()
+                except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            "safety_gate",
+                            "Post-plan safety gate check",
+                            "stopped",
+                            error=str(exc),
+                        )
+                    self._emit_history("safety_gate", "stopped", str(exc))
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="stopped",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=str(exc),
+                            summary=f"Execution halted by safety gate: {exc}",
+                        )
+                    )
+
+                # Stuck no-op loop guard on new (non-retry) planned actions
+                if step_retries == 0 and action.action_type not in (ActionType.done, ActionType.fail):
+                    action_sig = (
                         action.action_type.value,
-                        action.description,
-                        "blocked",
-                        policy_decision="blocked",
-                        approval_status="not_required",
-                        error=decision.reason,
+                        action.x,
+                        action.y,
+                        action.text,
+                        tuple(action.keys) if action.keys else None,
+                        action.target_path,
                     )
-                self._emit_history(action.action_type.value, "blocked", decision.reason)
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="failed",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=decision.reason,
-                        summary=f"Blocked by policy ({decision.risk_category}): {decision.reason}",
-                    )
-                )
+                    if action_sig == last_action_sig:
+                        consecutive_identical += 1
+                    else:
+                        last_action_sig = action_sig
+                        consecutive_identical = 1
+                    if self.max_no_op_repeats > 0 and consecutive_identical >= self.max_no_op_repeats:
+                        loop_err = (
+                            f"Stuck no-op loop detected: repeated {action.action_type.value} "
+                            f"{consecutive_identical} consecutive times"
+                        )
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "failed",
+                                error=loop_err,
+                            )
+                        self._emit_history(action.action_type.value, "failed", loop_err)
+                        return _complete(
+                            ExecutionResult(
+                                run_id=run_id,
+                                status="failed",
+                                steps_executed=steps_executed,
+                                retries_used=retries_used,
+                                error=loop_err,
+                                summary=loop_err,
+                            )
+                        )
 
-            approval_status = "not_required"
-            policy_label = "allowed"
-            if decision.requires_approval:
-                policy_label = "requires_approval"
-                approved = (
-                    bool(self.approval_callback(action, decision))
-                    if self.approval_callback is not None
-                    else False
-                )
-                if not approved:
+                # 3. Policy & Approval Gate
+                decision = self.policy.evaluate(action)
+                if not decision.allowed:
                     if self.store is not None:
                         self.store.log_action(
                             run_id,
                             step_index,
                             action.action_type.value,
                             action.description,
-                            "denied",
-                            policy_decision=policy_label,
-                            approval_status="denied",
+                            "blocked",
+                            policy_decision="blocked",
+                            approval_status="not_required",
                             error=decision.reason,
                         )
-                    self._emit_history(action.action_type.value, "denied", decision.reason)
-                    return self._finish_and_emit(
+                    self._emit_history(action.action_type.value, "blocked", decision.reason)
+                    return _complete(
                         ExecutionResult(
                             run_id=run_id,
-                            status="denied",
+                            status="failed",
                             steps_executed=steps_executed,
                             retries_used=retries_used,
-                            error=f"Approval denied: {decision.reason}",
-                            summary=f"Denied by operator ({decision.risk_category})",
+                            error=decision.reason,
+                            summary=f"Blocked by policy ({decision.risk_category}): {decision.reason}",
                         )
                     )
-                approval_status = "approved"
 
-            # 4. Terminal actions (done / fail)
-            if action.action_type == ActionType.done:
-                self._emit_progress(progress_total, progress_total, action.description)
-                steps_executed += 1
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        action.action_type.value,
-                        action.description,
-                        "completed",
-                        policy_decision=policy_label,
-                        approval_status=approval_status,
-                        verification="Task completed",
+                approval_status = "not_required"
+                policy_label = "allowed"
+                if decision.requires_approval:
+                    policy_label = "requires_approval"
+                    approved = (
+                        bool(self.approval_callback(action, decision))
+                        if self.approval_callback is not None
+                        else False
                     )
-                self._emit_history("done", "completed", action.description)
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="completed",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        summary=action.description,
-                    )
-                )
+                    if self.safety.emergency_stopped:
+                        try:
+                            self.safety.assert_can_execute()
+                        except (EmergencyStopError, SafetyGateError) as exc:
+                            if self.store is not None:
+                                self.store.log_action(
+                                    run_id,
+                                    step_index,
+                                    "safety_gate",
+                                    "Post-approval safety gate check",
+                                    "stopped",
+                                    policy_decision=policy_label,
+                                    approval_status="stopped",
+                                    error=str(exc),
+                                )
+                            self._emit_history("safety_gate", "stopped", str(exc))
+                            return _complete(
+                                ExecutionResult(
+                                    run_id=run_id,
+                                    status="stopped",
+                                    steps_executed=steps_executed,
+                                    retries_used=retries_used,
+                                    error=str(exc),
+                                    summary=f"Execution halted by safety gate: {exc}",
+                                )
+                            )
+                    if not approved:
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "denied",
+                                policy_decision=policy_label,
+                                approval_status="denied",
+                                error=decision.reason,
+                            )
+                        self._emit_history(action.action_type.value, "denied", decision.reason)
+                        return _complete(
+                            ExecutionResult(
+                                run_id=run_id,
+                                status="denied",
+                                steps_executed=steps_executed,
+                                retries_used=retries_used,
+                                error=f"Approval denied: {decision.reason}",
+                                summary=f"Denied by operator ({decision.risk_category})",
+                            )
+                        )
+                    approval_status = "approved"
 
-            if action.action_type == ActionType.fail:
-                err = action.reason or action.description
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        action.action_type.value,
-                        action.description,
-                        "failed",
-                        policy_decision=policy_label,
-                        approval_status=approval_status,
-                        error=err,
+                # Re-check safety gate after approval and before terminal/physical execution
+                try:
+                    self.safety.assert_can_execute()
+                except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            "safety_gate",
+                            "Pre-execution safety gate check",
+                            "stopped",
+                            policy_decision=policy_label,
+                            approval_status=approval_status,
+                            error=str(exc),
+                        )
+                    self._emit_history("safety_gate", "stopped", str(exc))
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="stopped",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=str(exc),
+                            summary=f"Execution halted by safety gate: {exc}",
+                        )
                     )
-                self._emit_history("fail", "failed", err)
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="failed",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=err,
-                        summary=action.description,
-                    )
-                )
 
-            # 5. Act & Verify
-            self._emit_progress(
-                min(step_index + 1, progress_total),
-                progress_total,
-                action.description,
-            )
-            try:
-                verification_msg = self._execute_action(action)
-            except (EmergencyStopError, SafetyGateError) as exc:
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        action.action_type.value,
-                        action.description,
-                        "stopped",
-                        policy_decision=policy_label,
-                        approval_status=approval_status,
-                        error=str(exc),
+                # 4. Terminal actions (done / fail)
+                if action.action_type == ActionType.done:
+                    self._emit_progress(progress_total, progress_total, action.description)
+                    steps_executed += 1
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            action.action_type.value,
+                            action.description,
+                            "completed",
+                            policy_decision=policy_label,
+                            approval_status=approval_status,
+                            verification="Task completed",
+                        )
+                    self._emit_history("done", "completed", action.description)
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="completed",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            summary=action.description,
+                        )
                     )
-                self._emit_history(action.action_type.value, "stopped", str(exc))
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="stopped",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=str(exc),
-                        summary=f"Execution stopped: {exc}",
-                    )
-                )
-            except (RuntimeError, OSError, ValueError) as exc:
-                err_str = str(exc)
-                if self.store is not None:
-                    self.store.log_action(
-                        run_id,
-                        step_index,
-                        action.action_type.value,
-                        action.description,
-                        "retry" if step_retries < self.max_retries else "failed",
-                        policy_decision=policy_label,
-                        approval_status=approval_status,
-                        error=err_str,
-                    )
-                self._emit_history(
-                    action.action_type.value,
-                    "retry" if step_retries < self.max_retries else "failed",
-                    err_str,
-                )
-                if step_retries < self.max_retries:
-                    step_retries += 1
-                    retries_used += 1
-                    last_error = err_str
-                    continue
-                return self._finish_and_emit(
-                    ExecutionResult(
-                        run_id=run_id,
-                        status="failed",
-                        steps_executed=steps_executed,
-                        retries_used=retries_used,
-                        error=err_str,
-                        summary=f"Step {step_index} failed after {self.max_retries} retries: {err_str}",
-                    )
-                )
 
-            # 6. Record successful step
-            step_retries = 0
-            last_error = None
-            steps_executed += 1
-            history.append(
-                {
-                    "step_index": step_index,
-                    "action_type": action.action_type.value,
-                    "description": action.description,
-                    "status": "ok",
-                    "verification": verification_msg,
-                }
-            )
-            if self.store is not None:
-                self.store.log_action(
-                    run_id,
-                    step_index,
-                    action.action_type.value,
+                if action.action_type == ActionType.fail:
+                    err = action.reason or action.description
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            action.action_type.value,
+                            action.description,
+                            "failed",
+                            policy_decision=policy_label,
+                            approval_status=approval_status,
+                            error=err,
+                        )
+                    self._emit_history("fail", "failed", err)
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="failed",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=err,
+                            summary=action.description,
+                        )
+                    )
+
+                # 5. Act & Verify
+                self._emit_progress(
+                    min(step_index + 1, progress_total),
+                    progress_total,
                     action.description,
-                    "ok",
-                    policy_decision=policy_label,
-                    approval_status=approval_status,
-                    verification=verification_msg,
                 )
-            self._emit_history(action.action_type.value, "ok", verification_msg)
-            step_index += 1
+                try:
+                    verification_msg = self._execute_action(action)
+                except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            action.action_type.value,
+                            action.description,
+                            "stopped",
+                            policy_decision=policy_label,
+                            approval_status=approval_status,
+                            error=str(exc),
+                        )
+                    self._emit_history(action.action_type.value, "stopped", str(exc))
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="stopped",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=str(exc),
+                            summary=f"Execution stopped: {exc}",
+                        )
+                    )
+                except (RuntimeError, OSError, ValueError) as exc:
+                    err_str = str(exc)
+                    history.append(
+                        {
+                            "step_index": step_index,
+                            "action_type": action.action_type.value,
+                            "description": action.description,
+                            "status": "error",
+                            "error": err_str,
+                        }
+                    )
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            step_index,
+                            action.action_type.value,
+                            action.description,
+                            "retry" if step_retries < self.max_retries else "failed",
+                            policy_decision=policy_label,
+                            approval_status=approval_status,
+                            error=err_str,
+                        )
+                    self._emit_history(
+                        action.action_type.value,
+                        "retry" if step_retries < self.max_retries else "failed",
+                        err_str,
+                    )
+                    if step_retries < self.max_retries:
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = err_str
+                        continue
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="failed",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=err_str,
+                            summary=f"Step {step_index} failed after {self.max_retries} retries: {err_str}",
+                        )
+                    )
 
-        max_err = f"Exceeded max_steps ({self.max_steps}) without completing task"
-        return self._finish_and_emit(
-            ExecutionResult(
-                run_id=run_id,
-                status="failed",
-                steps_executed=steps_executed,
-                retries_used=retries_used,
-                error=max_err,
-                summary=max_err,
+                # 6. Record successful step
+                step_retries = 0
+                last_error = None
+                steps_executed += 1
+                history.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type.value,
+                        "description": action.description,
+                        "status": "ok",
+                        "verification": verification_msg,
+                    }
+                )
+                if self.store is not None:
+                    self.store.log_action(
+                        run_id,
+                        step_index,
+                        action.action_type.value,
+                        action.description,
+                        "ok",
+                        policy_decision=policy_label,
+                        approval_status=approval_status,
+                        verification=verification_msg,
+                    )
+                self._emit_history(action.action_type.value, "ok", verification_msg)
+                step_index += 1
+
+            max_err = f"Exceeded max_steps ({self.max_steps}) without completing task"
+            return _complete(
+                ExecutionResult(
+                    run_id=run_id,
+                    status="failed",
+                    steps_executed=steps_executed,
+                    retries_used=retries_used,
+                    error=max_err,
+                    summary=max_err,
+                )
             )
-        )
+        except Exception as exc:
+            unexpected_error = f"Unexpected execution error: {exc}"
+            raise
+        finally:
+            if not run_finished and self.store is not None:
+                self.store.finish_run(
+                    run_id,
+                    "failed",
+                    error=unexpected_error or "Run aborted unexpectedly",
+                )
+            if not self.safety.emergency_stopped:
+                self.safety.revoke_authorization()

@@ -19,14 +19,14 @@ _ELEVATION_PATTERNS = re.compile(
 )
 
 _SYSTEM_PATH_PATTERNS = re.compile(
-    r"(?i)(?:[a-z]:\\windows\b|\\windows\\system32\b|\bsystem32\b|"
-    r"[a-z]:\\program files(?:\s*\(x86\))?\b|\bprogram files\b|"
-    r"\\appdata\b|\bappdata\\|"
-    r"[a-z]:\\users\\[^\\\s]+\\desktop\b)"
+    r"(?i)(?:[a-z]:[\\/]windows\b|[\\/]windows[\\/]system32\b|\bsystem32\b|"
+    r"[a-z]:[\\/]program files(?:\s*\(x86\))?\b|\bprogram files\b|"
+    r"[\\/]appdata\b|\bappdata[\\/]|"
+    r"[a-z]:[\\/]users[\\/][^\\/\s]+[\\/]desktop\b)"
 )
 
-_WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"(?i)([a-z]:\\[^\s\"'<>|]+)")
-_UNC_PATH_PATTERN = re.compile(r"\\\\[^\\\s]+\\[^\\\s]+")
+_WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z]:(?![\\/]{2})[\\/][^\s\"'<>|]+)")
+_UNC_PATH_PATTERN = re.compile(r"(?:^|[\s\"'(=])(?:\\\\|//)[^\\/\s]+(?:\\|/)[^\\/\s]+")
 _WRITE_DELETE_HINTS = re.compile(
     r"(?i)\b(?:write|save|create|mkdir|delete|remove|unlink|erase|overwrite|copy|move|modify|append|edit)\b"
 )
@@ -129,7 +129,7 @@ _APPROVAL_CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 _DOWNLOADS_EXEC_PATTERN = re.compile(
-    r"(?i)downloads\\[^\s\"']*\.(?:exe|msi|bat|cmd|ps1|vbs|scr)\b"
+    r"(?i)downloads[\\/][^\s\"']*\.(?:exe|msi|bat|cmd|ps1|vbs|scr)\b"
 )
 
 
@@ -185,13 +185,14 @@ class PolicyEngine:
         last_idx = 0
         for match in _WINDOWS_DRIVE_PATH_PATTERN.finditer(combined):
             path_str = match.group(1).rstrip(".,;:)]}")
-            if not self.is_within_sandbox(path_str):
+            normalized_path = path_str.replace("/", "\\")
+            if not self.is_within_sandbox(normalized_path):
                 return f"Action text references path outside approved_workspace: {path_str}"
             # Strip verified sandbox path before checking generic system path patterns
             sanitized_parts.append(combined[last_idx:match.start()])
             last_idx = match.end()
         sanitized_parts.append(combined[last_idx:])
-        sanitized = "".join(sanitized_parts)
+        sanitized = "".join(sanitized_parts).replace("/", "\\")
 
         if _SYSTEM_PATH_PATTERNS.search(sanitized):
             return "Action references a restricted Windows/system/Desktop path outside approved_workspace"
@@ -219,12 +220,29 @@ class PolicyEngine:
 
         # 2. Unconditionally block any target_path outside approved_workspace
         if action.target_path is not None and action.target_path.strip():
-            if not self.is_within_sandbox(action.target_path):
+            if not self.is_within_sandbox(action.target_path.replace("/", "\\")):
                 return PolicyDecision(
                     allowed=False,
                     requires_approval=False,
                     risk_category="sandbox_violation",
                     reason=f"Target path {action.target_path!r} is outside approved_workspace",
+                )
+
+        # 2b. Block launch_app paths outside approved_workspace while permitting bare system names
+        if action.app_name is not None and action.app_name.strip():
+            app_raw = action.app_name.strip()
+            has_path_sep = (
+                "/" in app_raw
+                or "\\" in app_raw
+                or ":" in app_raw
+                or app_raw.startswith("..")
+            )
+            if has_path_sep and not self.is_within_sandbox(app_raw.replace("/", "\\")):
+                return PolicyDecision(
+                    allowed=False,
+                    requires_approval=False,
+                    risk_category="sandbox_violation",
+                    reason=f"Application path {action.app_name!r} is outside approved_workspace",
                 )
 
         # 3. Unconditionally block restricted system/outside paths in text or description
@@ -249,7 +267,7 @@ class PolicyEngine:
                 reason=action.reason or action.description,
             )
 
-        # 5. Check all 7 approval-required risk categories
+        # 5. Check destructive/form key combinations and all 7 approval-required risk categories
         haystack = " ".join(
             str(part)
             for part in (
@@ -263,6 +281,26 @@ class PolicyEngine:
             )
             if part
         ).lower()
+
+        normalized_keys = [k.strip().lower() for k in (action.keys or []) if k.strip()]
+        if any(k in {"delete", "del"} for k in normalized_keys):
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=True,
+                risk_category="delete_or_overwrite",
+                reason=action.reason
+                or f"Requires user approval for destructive key press {action.keys}: {action.description}",
+            )
+        if "submit" in normalized_keys and any(
+            kw in haystack for kw in ("form", "application", "checkout", "order", "payment")
+        ):
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=True,
+                risk_category="submit_form",
+                reason=action.reason
+                or f"Requires user approval for form submission key {action.keys}: {action.description}",
+            )
 
         explicit_cat = (action.risk_category or "").strip().lower()
         for category, keywords in _APPROVAL_CATEGORY_KEYWORDS:
