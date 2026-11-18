@@ -1,0 +1,7 @@
+.funguys/
+.graphify/
+.venv/
+node_modules/
+__pycache__/
+.env
+.env.*
