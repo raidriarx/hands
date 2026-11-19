@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -10,8 +11,10 @@ from pydantic import BaseModel
 
 from controller.schema import ActionType, DesktopAction
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 APPROVED_WORKSPACE = Path(
-    r"C:\Users\User\Documents\funguys-lab\desktop-controller\approved_workspace"
+    os.environ.get("DESKTOP_CONTROLLER_WORKSPACE", "").strip()
+    or str(_PROJECT_ROOT / "approved_workspace")
 )
 
 _ELEVATION_PATTERNS = re.compile(

@@ -19,10 +19,10 @@ def _configure_paths() -> None:
         sys.path.remove(root_str)
     sys.path.insert(0, root_str)
 
+    venv_dir = workspace_root / ".venv"
     candidate_site_packages = [
-        workspace_root / ".venv" / "Lib" / "site-packages",
-        Path(r"C:\Users\User\Documents\funguys-lab\desktop-controller\.venv\Lib\site-packages"),
-        Path.home() / "Documents" / "funguys-lab" / "desktop-controller" / ".venv" / "Lib" / "site-packages",
+        venv_dir / "Lib" / "site-packages",
+        *sorted((venv_dir / "lib").glob("python*/site-packages")),
     ]
     for candidate in candidate_site_packages:
         if candidate.is_dir():

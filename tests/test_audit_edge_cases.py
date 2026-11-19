@@ -68,7 +68,7 @@ from controller.planners import (
     scale_normalized_coord,
     subregion_viewport,
 )
-from controller.policy import PolicyEngine
+from controller.policy import APPROVED_WORKSPACE, PolicyEngine
 from controller.schema import ActionType, DesktopAction, SpeedConfig, SpeedPreset
 from controller.store import SQLiteAuditStore, redact_secrets
 from controller.uia import extract_priority_terms, prioritize_ui_elements
@@ -2291,3 +2291,34 @@ class TestBrowserControlAndApiKeyUX:
         assert res2.retries_used == 0
         assert live_like_driver.typed_texts == ["hi", "hi"]
         assert not any(err and "Duplicate text warning" in err for err in refocus_planner.seen_errors)
+
+    def test_repo_portability_and_bootstrap_files_present_and_valid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("DESKTOP_CONTROLLER_WORKSPACE", raising=False)
+        repo_root = Path(__file__).resolve().parent.parent
+        assert APPROVED_WORKSPACE == repo_root / "approved_workspace"
+        assert PolicyEngine().approved_workspace == APPROVED_WORKSPACE
+
+        for filename in ("README.md", "AGENTS.md", "requirements.txt", ".env.example", "setup.ps1"):
+            assert (repo_root / filename).is_file(), f"Missing bootstrap file: {filename}"
+
+        setup_ps1 = repo_root / "setup.ps1"
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"$errs = $null; "
+                    f"[void][System.Management.Automation.Language.Parser]::ParseFile('{setup_ps1}', [ref]$null, [ref]$errs); "
+                    f"if ($errs.Count -gt 0) {{ $errs | ForEach-Object {{ Write-Error $_.Message }}; exit 1 }}"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+        assert proc.returncode == 0, proc.stderr

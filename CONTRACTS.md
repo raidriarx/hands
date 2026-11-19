@@ -18,7 +18,7 @@
   - Once emergency-stopped, all further execution is blocked until explicit `reset_emergency_stop()`.
 
 ## 4. Policy & Approval Engine (`controller/policy.py`)
-- `APPROVED_WORKSPACE = Path(r"C:\Users\User\Documents\funguys-lab\desktop-controller\approved_workspace")`.
+- `APPROVED_WORKSPACE` defaults to `<repo_root>/approved_workspace` (overridable via `DESKTOP_CONTROLLER_WORKSPACE` env var or `PolicyEngine(approved_workspace=...)`).
 - Deterministic `PolicyEngine.evaluate(action: DesktopAction) -> PolicyDecision(allowed, requires_approval, risk_category, reason)`:
   - Blocks admin/privilege escalation (`runas`, UAC elevation) and path writes/reads outside `approved_workspace`.
   - Requires explicit user approval (`requires_approval=True`) before: sending emails/messages, publishing social posts, submitting applications/web forms, deleting or overwriting important files, installing/executing software, changing Windows/system settings, or accessing sensitive directories/credentials.
@@ -30,9 +30,11 @@
 ## 6. SQLite Audit Store (`controller/store.py`)
 - `SQLiteAuditStore(db_path)` persisting `task_runs` and `action_logs` with `redact_secrets()` preventing API keys/tokens from entering SQLite or logs.
 
-## 7. Pluggable Planners & Execution Loop (`controller/planners.py`, `controller/engine.py`)
-- `BasePlanner` implemented by `GeminiPlanner` (`GEMINI_API_KEY`), `OpenAIPlanner` (`OPENAI_API_KEY`), `OllamaPlanner` (`http://localhost:11434`), and `LocalDemoFallbackPlanner`.
-- `DesktopExecutionEngine` executes Observe -> Plan -> Validate -> Policy/Approval Gate -> Act -> Verify with bounded `max_retries`.
+## 7. Pluggable Planners, Interpreter, UIA & Execution Loop (`controller/planners.py`, `controller/interpreter.py`, `controller/uia.py`, `controller/engine.py`)
+- `BasePlanInterpreter` (`AntigravityCLIInterpreter` + `OllamaPlanInterpreter` via `HybridPlanInterpreter`) classifies tasks using active/visible window context into structured `TaskPlan` objects (supporting web tab/window reuse and adaptive recovery).
+- `collect_foreground_ui_elements` (`controller/uia.py`) runs Windows UI Automation (`UIAutomationCore.dll`) on a dedicated single-thread MTA COM worker with task-keyword prioritization (`prioritize_ui_elements`).
+- `BasePlanner` implemented by `GeminiPlanner` (`GEMINI_API_KEY`), `OpenAIPlanner` (`OPENAI_API_KEY`), `OllamaPlanner` (`http://127.0.0.1:11434`), and `LocalDemoFallbackPlanner`.
+- `DesktopExecutionEngine` executes Observe -> Plan -> Validate -> Policy/Approval Gate -> Act -> Verify with normalized `0..1000` AI viewport coordinates, duplicate/loop guards, and bounded `max_retries`.
 
 ## 8. Window B GUI (`controller/gui.py`, `main.py`)
 - PySide6 `DesktopControllerWindow(QMainWindow)` running side-by-side with FunGuys Window A, providing task input, speed presets, backend selector + status, live screenshot preview, interactive Approve/Deny panel, Start/Pause/Resume/Manual Takeover/Emergency Stop buttons, and scrollable Action History.

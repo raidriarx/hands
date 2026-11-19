@@ -12,7 +12,7 @@ $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $entryScript = Join-Path $PSScriptRoot "main.py"
 
 if (-not (Test-Path $venvPython)) {
-    throw "Virtual environment Python not found at $venvPython"
+    throw "Virtual environment Python not found at $venvPython. Run .\setup.ps1 first."
 }
 
 $cliArgs = @("--speed", $Speed, "--backend", $Backend)
