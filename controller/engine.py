@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
 import time
 import urllib.parse
 from typing import Any, Callable, Optional
@@ -14,12 +16,15 @@ from pydantic import BaseModel
 from controller.driver import (
     BaseDesktopDriver,
     MockDryRunDriver,
+    _clean_visible_window_titles,
     _get_foreground_window_title,
+    _list_visible_window_titles,
     cleanup_notepads_for_fresh_demo,
     find_window_rect,
     get_foreground_window_rect,
 )
 from controller.emergency import EmergencyStopError, SafetyController, SafetyGateError
+from controller.interpreter import BasePlanInterpreter, HybridPlanInterpreter, TaskPlan
 from controller.planners import (
     BasePlanner,
     GeminiPlanner,
@@ -32,14 +37,52 @@ from controller.planners import (
     annotate_screenshot_for_planner,
     compute_screenshot_change_ratio,
     create_planner,
+    crop_screenshot_to_viewport,
     extract_som_marks,
     is_browser_or_media_task,
     locate_youtube_music_play_button,
+    map_viewport_coord,
+    normalize_to_viewport,
     scale_normalized_coord,
+    subregion_viewport,
 )
 from controller.policy import PolicyDecision, PolicyEngine
 from controller.schema import ActionType, DesktopAction
 from controller.store import SQLiteAuditStore
+from controller.uia import collect_foreground_ui_elements, extract_priority_terms
+
+
+def _normalize_message_for_dedup(text: str) -> str:
+    """Normalize typed text to lowercase space-separated words for spam deduplication."""
+    return re.sub(r"[\W_]+", " ", str(text or "").lower()).strip()
+
+
+def _is_duplicate_message(candidate: str, recent_texts: list[str]) -> bool:
+    """Return True if candidate matches or nearly duplicates recently sent chat text."""
+    raw = str(candidate or "").strip()
+    if not raw:
+        return False
+    lower = raw.lower()
+    if lower.startswith(("http://", "https://")) or "\\" in raw or "/" in raw:
+        return False
+    cand_norm = _normalize_message_for_dedup(raw)
+    if not cand_norm:
+        return False
+    cand_words = set(cand_norm.split())
+    for prev in recent_texts[-4:]:
+        prev_norm = _normalize_message_for_dedup(prev)
+        if not prev_norm:
+            continue
+        if cand_norm == prev_norm:
+            return True
+        if len(cand_norm) >= 10 and len(prev_norm) >= 10:
+            prev_words = set(prev_norm.split())
+            min_len = min(len(cand_words), len(prev_words))
+            if min_len >= 4:
+                overlap = len(cand_words & prev_words) / float(min_len)
+                if overlap >= 0.75:
+                    return True
+    return False
 
 
 class ExecutionResult(BaseModel):
@@ -74,6 +117,11 @@ class DesktopExecutionEngine:
         completion_callback: Optional[Callable[[ExecutionResult], None]] = None,
         max_no_op_repeats: int = 5,
         max_wall_seconds: float = 300.0,
+        uia_collector: Optional[
+            Callable[[tuple[int, int, int, int], tuple[int, int]], list[dict[str, Any]]]
+        ] = None,
+        plan_interpreter: Optional[BasePlanInterpreter] = None,
+        auto_approve_supervised: bool = False,
     ) -> None:
         self.driver = driver
         self.safety = safety
@@ -91,6 +139,11 @@ class DesktopExecutionEngine:
         self.completion_callback = completion_callback
         self.max_no_op_repeats = max(0, int(max_no_op_repeats))
         self.max_wall_seconds = max(0.01, float(max_wall_seconds))
+        self._custom_uia_collector: bool = uia_collector is not None
+        self.uia_collector = uia_collector or collect_foreground_ui_elements
+        self._explicit_plan_interpreter = plan_interpreter is not None
+        self.plan_interpreter: Optional[BasePlanInterpreter] = plan_interpreter
+        self.auto_approve_supervised: bool = bool(auto_approve_supervised)
 
     def _emit_history(self, action_type: str, status: str, detail: str) -> None:
         if self.history_callback is not None:
@@ -147,6 +200,36 @@ class DesktopExecutionEngine:
             return self.driver.active_window_text
         return _get_foreground_window_title()
 
+    def _visible_window_titles(self) -> list[str]:
+        if isinstance(self.driver, MockDryRunDriver):
+            return _clean_visible_window_titles(list(self.driver.visible_window_titles))
+        return _clean_visible_window_titles(_list_visible_window_titles())
+
+    def _call_plan_interpreter(
+        self,
+        interpreter: BasePlanInterpreter,
+        task_text: str,
+        *,
+        failure_context: Optional[str] = None,
+        active_window_title: Optional[str] = None,
+        visible_window_titles: Optional[list[str]] = None,
+    ) -> Optional[TaskPlan]:
+        try:
+            params = inspect.signature(interpreter.interpret_task).parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            kwargs: dict[str, Any] = {}
+            if accepts_kwargs or "failure_context" in params:
+                kwargs["failure_context"] = failure_context
+            if accepts_kwargs or "active_window_title" in params:
+                kwargs["active_window_title"] = active_window_title
+            if accepts_kwargs or "visible_window_titles" in params:
+                kwargs["visible_window_titles"] = visible_window_titles
+            return interpreter.interpret_task(task_text, **kwargs)
+        except Exception:
+            return None
+
     def _execute_action(self, action: DesktopAction) -> str:
         at = action.action_type
         if at == ActionType.click:
@@ -174,6 +257,16 @@ class DesktopExecutionEngine:
             args = [action.target_path] if action.target_path else None
             self.driver.launch_app(str(action.app_name), args=args)
             return f"Launched {action.app_name}"
+        if at == ActionType.open_url:
+            browser = (action.app_name or "firefox").strip() or "firefox"
+            meta = self.driver.open_url(str(action.url), browser=browser)
+            if isinstance(meta, dict) and meta.get("reused_existing_window"):
+                matched = meta.get("matched_window_title") or browser
+                return (
+                    f"Focused existing window {matched!r} instead of opening a new tab "
+                    "(if you need a different page on this site, click inside the page or press Ctrl+L in this tab)"
+                )
+            return f"Opened URL {action.url} in {browser}"
         if at == ActionType.verify_state:
             ok, msg = self.driver.verify_state(
                 target_path=action.target_path,
@@ -245,12 +338,29 @@ class DesktopExecutionEngine:
         step_retries = 0
         last_error: Optional[str] = None
         history: list[dict[str, Any]] = []
+        ai_history: list[dict[str, Any]] = []
         executed_sigs: list[tuple[Any, ...]] = []
         recent_click_coords: list[tuple[int, int]] = []
         prev_screenshot: Optional[Image.Image] = None
         screen_changed_last_step: Optional[bool] = None
         last_action_sig: Optional[tuple[Any, ...]] = None
         consecutive_identical = 0
+        active_viewport: Optional[tuple[int, int, int, int]] = None
+        consecutive_zooms = 0
+        is_ai_planner = isinstance(self.planner, (GeminiPlanner, OpenAIPlanner, OllamaPlanner))
+        recent_sent_texts: list[str] = []
+        last_open_url_reused: bool = False
+        priority_terms = extract_priority_terms(task_text) if is_ai_planner else []
+        interpreter: Optional[BasePlanInterpreter] = self.plan_interpreter
+        if (
+            interpreter is None
+            and is_ai_planner
+            and not self._explicit_plan_interpreter
+            and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
+        ):
+            interpreter = HybridPlanInterpreter()
+        current_plan: Optional[TaskPlan] = None
+        replans_used = 0
         wall_deadline = time.monotonic() + self.max_wall_seconds
         run_finished = False
         unexpected_error: Optional[str] = None
@@ -261,6 +371,56 @@ class DesktopExecutionEngine:
             return self._finish_and_emit(result)
 
         try:
+            if is_ai_planner and interpreter is not None:
+                try:
+                    self._wait_if_paused()
+                    self._emit_progress(0, progress_total, "Interpreting task plan...")
+                    initial_active_title = self._active_window_title()
+                    initial_visible_titles = self._visible_window_titles()
+                    current_plan = self._call_plan_interpreter(
+                        interpreter,
+                        task_text,
+                        active_window_title=initial_active_title,
+                        visible_window_titles=initial_visible_titles,
+                    )
+                    self.safety.assert_can_execute()
+                    if current_plan is not None:
+                        plan_summary = (
+                            f"[{current_plan.source}] {current_plan.strategy}: "
+                            f"{current_plan.intent_summary}"
+                        )
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                0,
+                                "plan_interpreter",
+                                current_plan.intent_summary,
+                                "ok",
+                                verification=plan_summary,
+                            )
+                        self._emit_history("plan_interpreter", "ok", plan_summary)
+                except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.store is not None:
+                        self.store.log_action(
+                            run_id,
+                            0,
+                            "safety_gate",
+                            "Pre-plan safety gate check",
+                            "stopped",
+                            error=str(exc),
+                        )
+                    self._emit_history("safety_gate", "stopped", str(exc))
+                    return _complete(
+                        ExecutionResult(
+                            run_id=run_id,
+                            status="stopped",
+                            steps_executed=steps_executed,
+                            retries_used=retries_used,
+                            error=str(exc),
+                            summary=f"Execution halted by safety gate: {exc}",
+                        )
+                    )
+
             while step_index < self.max_steps:
                 if time.monotonic() >= wall_deadline:
                     wall_err = f"Exceeded max_wall_seconds ({self.max_wall_seconds}s) without completing task"
@@ -295,29 +455,37 @@ class DesktopExecutionEngine:
                         last_entry = history[-1]
                         if (
                             isinstance(self.driver, MockDryRunDriver)
-                            or last_entry.get("action_type") in ("wait", "move", "verify_state")
+                            or last_entry.get("action_type")
+                            in ("wait", "move", "verify_state", "view_region", "view_screen")
                         ):
                             screen_changed_last_step = True
                         else:
                             diff_ratio = compute_screenshot_change_ratio(prev_screenshot, screenshot)
                             screen_changed_last_step = diff_ratio >= 0.002
                         last_entry["screen_changed"] = screen_changed_last_step
+                        if ai_history:
+                            ai_history[-1]["screen_changed"] = screen_changed_last_step
                         if (
                             not screen_changed_last_step
                             and last_entry.get("action_type") in ("click", "double_click", "type_text", "press_keys")
                         ):
+                            if last_entry.get("action_type") == "type_text" and recent_sent_texts:
+                                recent_sent_texts.pop()
                             last_error = (
                                 f"Self-correction warning: Previous step ({last_entry.get('action_type')}: "
                                 f"{last_entry.get('description')}) produced NO visible change on the screen. "
                                 "The target element was missed or unfocused. Do NOT repeat the same coordinates "
-                                "or action; try a different coordinate or navigate directly via Ctrl+L."
+                                "or action; zoom in with view_region, pick a mark_id from ui_elements, "
+                                "try a different coordinate, or navigate directly via Ctrl+L."
                             )
                     if step_retries == 0:
                         prev_screenshot = screenshot
 
                     screen_size = self.driver.get_screen_size()
+                    raw_cursor_pos = self.driver.get_cursor_position()
                     active_rect = self._active_window_rect()
                     active_title = self._active_window_title()
+                    visible_titles = self._visible_window_titles()
                     detected_ui_hints: dict[str, Any] = {}
                     navigated_to_yt_search = any(
                         entry.get("action_type") == "type_text"
@@ -335,22 +503,127 @@ class DesktopExecutionEngine:
                             f"https://music.youtube.com/search?q={urllib.parse.quote_plus(_extract_song_query(task_text))}"
                         )
 
-                    som_marks = extract_som_marks(screenshot, screen_size)
-
-                    obs = ObservationContext(
-                        task_text=task_text,
-                        step_index=step_index,
-                        screen_size=screen_size,
-                        cursor_pos=self.driver.get_cursor_position(),
-                        active_window_rect=active_rect,
-                        active_window_title=active_title,
-                        screen_changed_last_step=screen_changed_last_step,
-                        som_marks={k: [v[0], v[1]] for k, v in som_marks.items()},
-                        detected_ui_hints=detected_ui_hints,
-                        history=list(history),
-                        last_error=last_error,
-                        approved_workspace=str(self.policy.approved_workspace),
+                    full_viewport = (0, 0, max(0, screen_size[0] - 1), max(0, screen_size[1] - 1))
+                    current_viewport = active_viewport or full_viewport
+                    planner_screenshot = (
+                        crop_screenshot_to_viewport(screenshot, current_viewport, screen_size)
+                        if (is_ai_planner and active_viewport is not None)
+                        else screenshot
                     )
+
+                    uia_elements = (
+                        (
+                            self.uia_collector(current_viewport, screen_size)
+                            if self._custom_uia_collector
+                            else collect_foreground_ui_elements(
+                                current_viewport,
+                                screen_size,
+                                priority_terms=priority_terms,
+                            )
+                        )
+                        if is_ai_planner
+                        else []
+                    )
+                    if uia_elements:
+                        mark_targets: dict[int, tuple[int, int]] = {
+                            int(el["id"]): (int(el["center"][0]), int(el["center"][1]))
+                            for el in uia_elements
+                        }
+                        obs_ui_elements = [
+                            {
+                                "id": int(el["id"]),
+                                "role": el["role"],
+                                "name": el["name"],
+                                "center": list(
+                                    normalize_to_viewport(
+                                        int(el["center"][0]),
+                                        int(el["center"][1]),
+                                        current_viewport,
+                                    )
+                                ),
+                            }
+                            for el in uia_elements
+                        ]
+                        som_marks: dict[int, tuple[int, int]] = {}
+                    else:
+                        som_marks = extract_som_marks(screenshot, screen_size)
+                        mark_targets = dict(som_marks)
+                        obs_ui_elements = []
+
+                    if is_ai_planner:
+                        norm_cursor = normalize_to_viewport(
+                            raw_cursor_pos[0],
+                            raw_cursor_pos[1],
+                            current_viewport,
+                        )
+                        norm_active_rect: Optional[tuple[int, int, int, int]] = None
+                        if active_rect is not None:
+                            nl, nt = normalize_to_viewport(
+                                active_rect[0], active_rect[1], current_viewport
+                            )
+                            nr, nb = normalize_to_viewport(
+                                active_rect[2], active_rect[3], current_viewport
+                            )
+                            norm_active_rect = (nl, nt, nr, nb)
+
+                        ai_hints = dict(detected_ui_hints)
+                        if "youtube_music_play_button_xy" in ai_hints:
+                            hx, hy = ai_hints["youtube_music_play_button_xy"]
+                            vl, vt, vr, vb = current_viewport
+                            if vl <= hx <= vr and vt <= hy <= vb:
+                                ai_hints["youtube_music_play_button_xy"] = list(
+                                    normalize_to_viewport(hx, hy, current_viewport)
+                                )
+                            else:
+                                ai_hints.pop("youtube_music_play_button_xy", None)
+
+                        active_region_norm: Optional[list[int]] = None
+                        if active_viewport is not None:
+                            al, at_y = normalize_to_viewport(
+                                active_viewport[0], active_viewport[1], full_viewport
+                            )
+                            ar, ab = normalize_to_viewport(
+                                active_viewport[2], active_viewport[3], full_viewport
+                            )
+                            active_region_norm = [al, at_y, ar, ab]
+
+                        obs = ObservationContext(
+                            task_text=task_text,
+                            step_index=step_index,
+                            screen_size=screen_size,
+                            cursor_pos=norm_cursor,
+                            active_window_rect=norm_active_rect,
+                            active_window_title=active_title,
+                            visible_window_titles=visible_titles,
+                            screen_changed_last_step=screen_changed_last_step,
+                            som_marks={},
+                            detected_ui_hints=ai_hints,
+                            history=list(ai_history),
+                            last_error=last_error,
+                            approved_workspace=str(self.policy.approved_workspace),
+                            viewport_mode="region" if active_viewport is not None else "full",
+                            active_region_normalized=active_region_norm,
+                            ui_elements=obs_ui_elements,
+                            coordinates_normalized=True,
+                            task_plan=current_plan.model_dump() if current_plan is not None else None,
+                        )
+                    else:
+                        obs = ObservationContext(
+                            task_text=task_text,
+                            step_index=step_index,
+                            screen_size=screen_size,
+                            cursor_pos=raw_cursor_pos,
+                            active_window_rect=active_rect,
+                            active_window_title=active_title,
+                            visible_window_titles=visible_titles,
+                            screen_changed_last_step=screen_changed_last_step,
+                            som_marks={k: [v[0], v[1]] for k, v in som_marks.items()},
+                            detected_ui_hints=detected_ui_hints,
+                            history=list(history),
+                            last_error=last_error,
+                            approved_workspace=str(self.policy.approved_workspace),
+                        )
+
                     if (
                         not isinstance(self.driver, MockDryRunDriver)
                         and os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1"
@@ -358,7 +631,7 @@ class DesktopExecutionEngine:
                         try:
                             preview_img = annotate_screenshot_for_planner(
                                 screenshot,
-                                obs.cursor_pos,
+                                raw_cursor_pos,
                                 screen_size,
                                 detected_ui_hints=detected_ui_hints,
                                 som_marks=som_marks,
@@ -366,6 +639,11 @@ class DesktopExecutionEngine:
                             if preview_img is not None:
                                 self.policy.approved_workspace.mkdir(parents=True, exist_ok=True)
                                 preview_img.save(self.policy.approved_workspace / "latest_step.png")
+                            if active_viewport is not None:
+                                self.policy.approved_workspace.mkdir(parents=True, exist_ok=True)
+                                planner_screenshot.save(
+                                    self.policy.approved_workspace / "latest_view_region.png"
+                                )
                         except Exception:
                             pass
                 except (EmergencyStopError, SafetyGateError) as exc:
@@ -391,22 +669,32 @@ class DesktopExecutionEngine:
                     )
 
                 # 2. Plan & Validate
+                planned_norm_xy: Optional[tuple[int, int]] = None
                 try:
-                    planned = self.planner.plan_next_step(obs, screenshot)
+                    planned = self.planner.plan_next_step(obs, planner_screenshot)
                     action = DesktopAction.model_validate(planned)
-                    if action.mark_id is not None and (action.x is None or action.y is None):
-                        if action.mark_id not in som_marks:
-                            raise ValueError(
-                                f"Unknown mark_id {action.mark_id}; choose a valid visible mark from {sorted(som_marks.keys())}"
+                    if action.action_type in (ActionType.click, ActionType.double_click, ActionType.move):
+                        if action.mark_id is not None:
+                            if action.mark_id in mark_targets:
+                                action.x, action.y = mark_targets[action.mark_id]
+                                if is_ai_planner:
+                                    planned_norm_xy = normalize_to_viewport(
+                                        action.x, action.y, current_viewport
+                                    )
+                            elif action.x is None or action.y is None:
+                                raise ValueError(
+                                    f"Unknown mark_id {action.mark_id}; choose a valid visible mark from {sorted(mark_targets.keys())}"
+                                )
+                            elif is_ai_planner:
+                                planned_norm_xy = (int(action.x), int(action.y))
+                                action.x, action.y = map_viewport_coord(
+                                    action.x, action.y, current_viewport
+                                )
+                        elif is_ai_planner and action.x is not None and action.y is not None:
+                            planned_norm_xy = (int(action.x), int(action.y))
+                            action.x, action.y = map_viewport_coord(
+                                action.x, action.y, current_viewport
                             )
-                        action.x, action.y = som_marks[action.mark_id]
-                    elif (
-                        isinstance(self.planner, (GeminiPlanner, OpenAIPlanner, OllamaPlanner))
-                        and action.x is not None
-                        and action.y is not None
-                    ):
-                        action.x = scale_normalized_coord(action.x, screen_size[0])
-                        action.y = scale_normalized_coord(action.y, screen_size[1])
                 except Exception as exc:
                     err_msg = f"Planner validation failed: {exc}"
                     if self.store is not None:
@@ -419,15 +707,15 @@ class DesktopExecutionEngine:
                             error=err_msg,
                         )
                     self._emit_history("plan", "failed", err_msg)
-                    history.append(
-                        {
-                            "step_index": step_index,
-                            "action_type": "plan",
-                            "description": "Plan next desktop action",
-                            "status": "error",
-                            "error": err_msg,
-                        }
-                    )
+                    plan_err_entry = {
+                        "step_index": step_index,
+                        "action_type": "plan",
+                        "description": "Plan next desktop action",
+                        "status": "error",
+                        "error": err_msg,
+                    }
+                    history.append(plan_err_entry)
+                    ai_history.append(dict(plan_err_entry))
                     if step_retries < self.max_retries:
                         step_retries += 1
                         retries_used += 1
@@ -474,8 +762,13 @@ class DesktopExecutionEngine:
                     action.action_type.value,
                     action.x,
                     action.y,
+                    action.left,
+                    action.top,
+                    action.right,
+                    action.bottom,
                     action.text,
                     tuple(action.keys) if action.keys else None,
+                    action.url,
                     action.target_path,
                 )
                 if step_retries == 0 and action.action_type not in (ActionType.done, ActionType.fail):
@@ -515,6 +808,87 @@ class DesktopExecutionEngine:
                     not isinstance(self.planner, LocalDemoFallbackPlanner)
                     and action.action_type not in (ActionType.done, ActionType.fail)
                 ):
+                    if (
+                        is_ai_planner
+                        and action.action_type == ActionType.view_region
+                        and consecutive_zooms >= 2
+                        and step_retries < self.max_retries
+                    ):
+                        zoom_warn = (
+                            "Already zoomed in 2 levels; click a target in this zoomed view (0..1000) "
+                            "or call view_screen to reset."
+                        )
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = zoom_warn
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "retry",
+                                error=zoom_warn,
+                            )
+                        self._emit_history(action.action_type.value, "retry", zoom_warn)
+                        continue
+
+                    if (
+                        is_ai_planner
+                        and action.action_type == ActionType.open_url
+                        and last_open_url_reused
+                        and action_sig == last_action_sig
+                        and step_retries < self.max_retries
+                    ):
+                        reuse_warn = (
+                            "This website is ALREADY open and focused in the current window! "
+                            "Do NOT call open_url again — interact directly with the page "
+                            "(click, view_region, or Ctrl+L)."
+                        )
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = reuse_warn
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "retry",
+                                error=reuse_warn,
+                            )
+                        self._emit_history(action.action_type.value, "retry", reuse_warn)
+                        continue
+
+                    if (
+                        is_ai_planner
+                        and action.action_type == ActionType.type_text
+                        and _is_duplicate_message(str(action.text or ""), recent_sent_texts)
+                        and step_retries < self.max_retries
+                    ):
+                        active_viewport = None
+                        consecutive_zooms = 0
+                        dup_warn = (
+                            "Duplicate text warning: You already typed a matching message recently. "
+                            "Do NOT repeat the same message or type the recipient's username into the chat box. "
+                            "Check the full chat thread: if waiting for a reply, call wait (5-8s); "
+                            "if they replied, write a new contextual reply; if finished, call done."
+                        )
+                        step_retries += 1
+                        retries_used += 1
+                        last_error = dup_warn
+                        if self.store is not None:
+                            self.store.log_action(
+                                run_id,
+                                step_index,
+                                action.action_type.value,
+                                action.description,
+                                "retry",
+                                error=dup_warn,
+                            )
+                        self._emit_history(action.action_type.value, "retry", dup_warn)
+                        continue
+
                     is_repeat_click = False
                     if (
                         action.action_type in (ActionType.click, ActionType.double_click)
@@ -542,11 +916,14 @@ class DesktopExecutionEngine:
                         and len(set(seq[-3:])) > 1
                     )
                     if (is_repeat_click or is_two_step_cycle or is_three_step_cycle) and step_retries < self.max_retries:
-                        coord_note = (
-                            f"clicked ({action.x}, {action.y}) or "
-                            if action.x is not None and action.y is not None
-                            else ""
-                        )
+                        if is_ai_planner and planned_norm_xy is not None:
+                            coord_note = (
+                                f"clicked normalized ({planned_norm_xy[0]}, {planned_norm_xy[1]}) or "
+                            )
+                        elif not is_ai_planner and action.x is not None and action.y is not None:
+                            coord_note = f"clicked ({action.x}, {action.y}) or "
+                        else:
+                            coord_note = ""
                         loop_warn = (
                             f"Loop detected: You already {coord_note}repeated the same action sequence "
                             "without making progress. Choose a completely different action or navigate "
@@ -597,61 +974,69 @@ class DesktopExecutionEngine:
                 policy_label = "allowed"
                 if decision.requires_approval:
                     policy_label = "requires_approval"
-                    approved = (
-                        bool(self.approval_callback(action, decision))
-                        if self.approval_callback is not None
-                        else False
-                    )
-                    if self.safety.emergency_stopped:
-                        try:
-                            self.safety.assert_can_execute()
-                        except (EmergencyStopError, SafetyGateError) as exc:
+                    if self.auto_approve_supervised:
+                        approval_status = "auto_approved"
+                        self._emit_history(
+                            "approval",
+                            "auto_approved",
+                            f"[Supervised/{decision.risk_category}] {decision.reason}",
+                        )
+                    else:
+                        approved = (
+                            bool(self.approval_callback(action, decision))
+                            if self.approval_callback is not None
+                            else False
+                        )
+                        if self.safety.emergency_stopped:
+                            try:
+                                self.safety.assert_can_execute()
+                            except (EmergencyStopError, SafetyGateError) as exc:
+                                if self.store is not None:
+                                    self.store.log_action(
+                                        run_id,
+                                        step_index,
+                                        "safety_gate",
+                                        "Post-approval safety gate check",
+                                        "stopped",
+                                        policy_decision=policy_label,
+                                        approval_status="stopped",
+                                        error=str(exc),
+                                    )
+                                self._emit_history("safety_gate", "stopped", str(exc))
+                                return _complete(
+                                    ExecutionResult(
+                                        run_id=run_id,
+                                        status="stopped",
+                                        steps_executed=steps_executed,
+                                        retries_used=retries_used,
+                                        error=str(exc),
+                                        summary=f"Execution halted by safety gate: {exc}",
+                                    )
+                                )
+                        if not approved:
                             if self.store is not None:
                                 self.store.log_action(
                                     run_id,
                                     step_index,
-                                    "safety_gate",
-                                    "Post-approval safety gate check",
-                                    "stopped",
+                                    action.action_type.value,
+                                    action.description,
+                                    "denied",
                                     policy_decision=policy_label,
-                                    approval_status="stopped",
-                                    error=str(exc),
+                                    approval_status="denied",
+                                    error=decision.reason,
                                 )
-                            self._emit_history("safety_gate", "stopped", str(exc))
+                            self._emit_history(action.action_type.value, "denied", decision.reason)
                             return _complete(
                                 ExecutionResult(
                                     run_id=run_id,
-                                    status="stopped",
+                                    status="denied",
                                     steps_executed=steps_executed,
                                     retries_used=retries_used,
-                                    error=str(exc),
-                                    summary=f"Execution halted by safety gate: {exc}",
+                                    error=f"Approval denied: {decision.reason}",
+                                    summary=f"Denied by operator ({decision.risk_category})",
                                 )
                             )
-                    if not approved:
-                        if self.store is not None:
-                            self.store.log_action(
-                                run_id,
-                                step_index,
-                                action.action_type.value,
-                                action.description,
-                                "denied",
-                                policy_decision=policy_label,
-                                approval_status="denied",
-                                error=decision.reason,
-                            )
-                        self._emit_history(action.action_type.value, "denied", decision.reason)
-                        return _complete(
-                            ExecutionResult(
-                                run_id=run_id,
-                                status="denied",
-                                steps_executed=steps_executed,
-                                retries_used=retries_used,
-                                error=f"Approval denied: {decision.reason}",
-                                summary=f"Denied by operator ({decision.risk_category})",
-                            )
-                        )
-                    approval_status = "approved"
+                        approval_status = "approved"
 
                 # Re-check safety gate after approval and before terminal/physical execution
                 try:
@@ -684,15 +1069,15 @@ class DesktopExecutionEngine:
                 if action.action_type == ActionType.done:
                     ok_done, done_msg = self._verify_task_completion(task_text, history)
                     if not ok_done:
-                        history.append(
-                            {
-                                "step_index": step_index,
-                                "action_type": ActionType.verify_state.value,
-                                "description": "Verify task completion before finishing",
-                                "status": "error",
-                                "error": done_msg,
-                            }
-                        )
+                        verify_err_entry = {
+                            "step_index": step_index,
+                            "action_type": ActionType.verify_state.value,
+                            "description": "Verify task completion before finishing",
+                            "status": "error",
+                            "error": done_msg,
+                        }
+                        history.append(verify_err_entry)
+                        ai_history.append(dict(verify_err_entry))
                         if self.store is not None:
                             self.store.log_action(
                                 run_id,
@@ -805,7 +1190,42 @@ class DesktopExecutionEngine:
                     )
 
                 try:
-                    verification_msg = self._execute_action(action)
+                    if action.action_type == ActionType.view_region:
+                        assert (
+                            action.left is not None
+                            and action.top is not None
+                            and action.right is not None
+                            and action.bottom is not None
+                        )
+                        active_viewport = subregion_viewport(
+                            int(action.left),
+                            int(action.top),
+                            int(action.right),
+                            int(action.bottom),
+                            current_viewport,
+                        )
+                        consecutive_zooms += 1
+                        verification_msg = (
+                            f"Zoomed into region ({action.left}, {action.top})-({action.right}, {action.bottom})"
+                        )
+                    elif action.action_type == ActionType.view_screen:
+                        active_viewport = None
+                        consecutive_zooms = 0
+                        verification_msg = "Reset view to full screen"
+                    else:
+                        verification_msg = self._execute_action(action)
+                        if action.action_type in (
+                            ActionType.click,
+                            ActionType.double_click,
+                            ActionType.type_text,
+                            ActionType.press_keys,
+                            ActionType.scroll,
+                            ActionType.launch_app,
+                            ActionType.open_url,
+                            ActionType.wait,
+                        ):
+                            active_viewport = None
+                            consecutive_zooms = 0
                 except EmergencyStopError as exc:
                     return _stop_step(str(exc))
                 except SafetyGateError as exc:
@@ -836,15 +1256,15 @@ class DesktopExecutionEngine:
                     return _stop_step(str(exc))
                 except (RuntimeError, OSError, ValueError) as exc:
                     err_str = str(exc)
-                    history.append(
-                        {
-                            "step_index": step_index,
-                            "action_type": action.action_type.value,
-                            "description": action.description,
-                            "status": "error",
-                            "error": err_str,
-                        }
-                    )
+                    step_err_entry = {
+                        "step_index": step_index,
+                        "action_type": action.action_type.value,
+                        "description": action.description,
+                        "status": "error",
+                        "error": err_str,
+                    }
+                    history.append(step_err_entry)
+                    ai_history.append(dict(step_err_entry))
                     if self.store is not None:
                         self.store.log_action(
                             run_id,
@@ -862,6 +1282,40 @@ class DesktopExecutionEngine:
                         err_str,
                     )
                     if step_retries < self.max_retries:
+                        if (
+                            is_ai_planner
+                            and interpreter is not None
+                            and replans_used < 1
+                            and (
+                                isinstance(exc, FileNotFoundError)
+                                or "winerror 2" in err_str.lower()
+                                or step_retries >= 1
+                            )
+                        ):
+                            new_plan = self._call_plan_interpreter(
+                                interpreter,
+                                task_text,
+                                failure_context=err_str,
+                                active_window_title=active_title,
+                                visible_window_titles=visible_titles,
+                            )
+                            if new_plan is not None:
+                                current_plan = new_plan
+                                replans_used += 1
+                                replan_summary = (
+                                    f"[{new_plan.source}] {new_plan.strategy}: "
+                                    f"{new_plan.intent_summary}"
+                                )
+                                if self.store is not None:
+                                    self.store.log_action(
+                                        run_id,
+                                        step_index,
+                                        "plan_interpreter",
+                                        new_plan.intent_summary,
+                                        "replanned",
+                                        verification=replan_summary,
+                                    )
+                                self._emit_history("plan_interpreter", "replanned", replan_summary)
                         if (
                             action.action_type == ActionType.verify_state
                             and _is_youtube_music_task(lower_task)
@@ -912,6 +1366,43 @@ class DesktopExecutionEngine:
                         "description": action.description,
                         "status": "ok",
                         "verification": verification_msg,
+                    }
+                )
+                ai_verification = verification_msg
+                last_open_url_reused = (
+                    action.action_type == ActionType.open_url
+                    and "instead of opening a new tab" in verification_msg
+                )
+                if is_ai_planner and action.action_type == ActionType.type_text and action.text:
+                    txt_val = str(action.text)
+                    lower_txt = txt_val.strip().lower()
+                    if lower_txt and not (
+                        lower_txt.startswith(("http://", "https://"))
+                        or "\\" in txt_val
+                        or "/" in txt_val
+                    ):
+                        recent_sent_texts.append(txt_val)
+                        recent_sent_texts = recent_sent_texts[-10:]
+                    ai_verification = f"Typed {txt_val.replace(chr(10), ' ')[:60]!r}"
+                if (
+                    is_ai_planner
+                    and planned_norm_xy is not None
+                    and action.action_type
+                    in (ActionType.click, ActionType.double_click, ActionType.move)
+                ):
+                    verb = {
+                        "click": "Clicked",
+                        "double_click": "Double-clicked",
+                        "move": "Moved cursor to",
+                    }[action.action_type.value]
+                    ai_verification = f"{verb} normalized ({planned_norm_xy[0]}, {planned_norm_xy[1]})"
+                ai_history.append(
+                    {
+                        "step_index": step_index,
+                        "action_type": action.action_type.value,
+                        "description": action.description,
+                        "status": "ok",
+                        "verification": ai_verification,
                     }
                 )
                 if self.store is not None:

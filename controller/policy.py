@@ -207,7 +207,7 @@ class PolicyEngine:
         # 1. Unconditionally block admin / UAC elevation attempts
         elevation_surface = " ".join(
             part
-            for part in (action.app_name, action.text, action.description)
+            for part in (action.app_name, action.url, action.text, action.description)
             if part
         )
         if _ELEVATION_PATTERNS.search(elevation_surface):
@@ -258,6 +258,64 @@ class PolicyEngine:
                 reason=outside_reason,
             )
 
+        # 3b. Read-only screen/region inspection, waits, and benign http(s) navigation
+        if action.action_type in (ActionType.view_region, ActionType.view_screen):
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=False,
+                risk_category="safe",
+                reason="Read-only screen inspection permitted under sandbox policy",
+            )
+        if action.action_type == ActionType.wait and not (action.risk_category or "").strip():
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=False,
+                risk_category="safe",
+                reason="Wait delay permitted under sandbox policy",
+            )
+        if action.action_type == ActionType.open_url:
+            raw_url = (action.url or "").strip()
+            lower_url = raw_url.lower()
+            if not (lower_url.startswith("http://") or lower_url.startswith("https://")):
+                return PolicyDecision(
+                    allowed=False,
+                    requires_approval=False,
+                    risk_category="sandbox_violation",
+                    reason=f"URL {action.url!r} must use http:// or https://",
+                )
+            nav_haystack = " ".join(
+                str(part)
+                for part in (action.url, action.description, action.risk_category)
+                if part
+            ).lower()
+            nav_explicit_cat = (action.risk_category or "").strip().lower()
+            high_risk_nav_cats = {"install_or_execute", "system_settings", "sensitive_access"}
+            for category, keywords in _APPROVAL_CATEGORY_KEYWORDS:
+                if category not in high_risk_nav_cats:
+                    continue
+                if nav_explicit_cat == category or any(kw in nav_haystack for kw in keywords):
+                    return PolicyDecision(
+                        allowed=True,
+                        requires_approval=True,
+                        risk_category=category,
+                        reason=action.reason
+                        or f"Requires user approval for {category}: {action.description}",
+                    )
+            if _DOWNLOADS_EXEC_PATTERN.search(nav_haystack):
+                return PolicyDecision(
+                    allowed=True,
+                    requires_approval=True,
+                    risk_category="install_or_execute",
+                    reason=action.reason
+                    or f"Requires user approval to execute downloaded software: {action.description}",
+                )
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=False,
+                risk_category="safe",
+                reason="Web navigation permitted under sandbox policy",
+            )
+
         # 4. Explicit request_approval always requires operator confirmation
         if action.action_type == ActionType.request_approval:
             return PolicyDecision(
@@ -275,6 +333,7 @@ class PolicyEngine:
                 action.risk_category,
                 action.target_path,
                 action.app_name,
+                action.url,
                 action.text,
                 action.reason,
                 action.description,

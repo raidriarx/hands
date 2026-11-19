@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import urllib.parse
 from enum import Enum
 from typing import Optional
 
@@ -12,6 +13,7 @@ MAX_WAIT_SECONDS = 300.0
 MAX_TEXT_LENGTH = 10000
 MAX_SCROLL_CLICKS = 100
 MAX_KEY_LENGTH = 32
+MAX_URL_LENGTH = 2048
 MAX_MOVE_DURATION_SEC = 30.0
 MAX_PIXELS_PER_SECOND = 20000.0
 MAX_POST_ACTION_DELAY_SEC = 30.0
@@ -29,7 +31,10 @@ class ActionType(str, Enum):
     scroll = "scroll"
     wait = "wait"
     launch_app = "launch_app"
+    open_url = "open_url"
     verify_state = "verify_state"
+    view_region = "view_region"
+    view_screen = "view_screen"
     request_approval = "request_approval"
     done = "done"
     fail = "fail"
@@ -43,7 +48,10 @@ class ActionType(str, Enum):
     SCROLL = "scroll"
     WAIT = "wait"
     LAUNCH_APP = "launch_app"
+    OPEN_URL = "open_url"
     VERIFY_STATE = "verify_state"
+    VIEW_REGION = "view_region"
+    VIEW_SCREEN = "view_screen"
     REQUEST_APPROVAL = "request_approval"
     DONE = "done"
     FAIL = "fail"
@@ -58,12 +66,17 @@ class DesktopAction(BaseModel):
     description: str
     x: Optional[int] = None
     y: Optional[int] = None
+    left: Optional[int] = None
+    top: Optional[int] = None
+    right: Optional[int] = None
+    bottom: Optional[int] = None
     mark_id: Optional[int] = None
     text: Optional[str] = None
     keys: Optional[list[str]] = None
     clicks: Optional[int] = None
     seconds: Optional[float] = None
     app_name: Optional[str] = None
+    url: Optional[str] = None
     target_path: Optional[str] = None
     expected_text: Optional[str] = None
     reason: Optional[str] = None
@@ -80,6 +93,11 @@ class DesktopAction(BaseModel):
             raise ValueError("y coordinate must be non-negative")
         if (self.x is None) != (self.y is None):
             raise ValueError("both x and y coordinates must be provided together")
+
+        for bound_name in ("left", "top", "right", "bottom"):
+            bound_val = getattr(self, bound_name)
+            if bound_val is not None and (bound_val < 0 or bound_val > 1000):
+                raise ValueError(f"{bound_name} must be within [0, 1000]")
 
         if self.text is not None and len(self.text) > MAX_TEXT_LENGTH:
             raise ValueError(f"text length must not exceed {MAX_TEXT_LENGTH} characters")
@@ -99,6 +117,15 @@ class DesktopAction(BaseModel):
                     raise ValueError(f"key entry {key!r} exceeds maximum length of {MAX_KEY_LENGTH}")
                 if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
                     raise ValueError("keys entries must not contain control characters or newlines")
+
+        if self.url is not None:
+            if len(self.url) > MAX_URL_LENGTH:
+                raise ValueError(f"url length must not exceed {MAX_URL_LENGTH} characters")
+            if any(ord(ch) <= 32 or ord(ch) == 127 for ch in self.url):
+                raise ValueError("url must not contain whitespace or control characters")
+            parsed_url = urllib.parse.urlparse(self.url)
+            if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc:
+                raise ValueError("url must be a valid http or https URL with a host")
 
         at = self.action_type
         if at in (ActionType.click, ActionType.double_click, ActionType.move):
@@ -121,11 +148,24 @@ class DesktopAction(BaseModel):
         elif at == ActionType.launch_app:
             if self.app_name is None or not self.app_name.strip():
                 raise ValueError("launch_app requires a non-empty app_name")
+        elif at == ActionType.open_url:
+            if self.url is None or not self.url.strip():
+                raise ValueError("open_url requires a non-empty http or https url")
         elif at == ActionType.verify_state:
             has_expected_text = self.expected_text is not None and bool(self.expected_text.strip())
             has_target_path = self.target_path is not None and bool(self.target_path.strip())
             if not (has_expected_text or has_target_path):
                 raise ValueError("verify_state requires expected_text or target_path")
+        elif at == ActionType.view_region:
+            if any(b is None for b in (self.left, self.top, self.right, self.bottom)):
+                raise ValueError("view_region requires left, top, right, and bottom bounds")
+            assert self.left is not None and self.top is not None and self.right is not None and self.bottom is not None
+            if self.right <= self.left or self.bottom <= self.top:
+                raise ValueError("view_region right/bottom bounds must be greater than left/top bounds")
+            if (self.right - self.left) < 20 or (self.bottom - self.top) < 20:
+                raise ValueError("view_region must span at least 20 normalized units in each direction")
+        elif at == ActionType.view_screen:
+            pass
         elif at == ActionType.request_approval:
             if self.reason is None or not self.reason.strip():
                 raise ValueError("request_approval requires a non-empty reason")

@@ -5,9 +5,12 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import re
 import shutil
 import subprocess
+import threading
 import time
+import urllib.parse
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -252,6 +255,148 @@ def _list_visible_window_titles() -> list[str]:
     return titles
 
 
+_WINDOW_TITLE_NOISE: set[str] = {
+    "program manager",
+    "windows input experience",
+    "default ime",
+    "msctfime ui",
+}
+
+_BROWSER_WINDOW_MARKERS: tuple[str, ...] = (
+    "firefox",
+    "chrome",
+    "edge",
+    "brave",
+    "opera",
+    "vivaldi",
+    "arc",
+)
+
+_KNOWN_SITE_TITLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "instagram.com": ("instagram",),
+    "music.youtube.com": ("youtube music",),
+    "youtube.com": ("youtube",),
+    "mail.google.com": ("gmail",),
+    "discord.com": ("discord",),
+    "web.whatsapp.com": ("whatsapp",),
+    "reddit.com": ("reddit",),
+    "x.com": (" / x", "twitter"),
+    "twitter.com": (" / x", "twitter"),
+    "open.spotify.com": ("spotify",),
+    "chatgpt.com": ("chatgpt",),
+    "chat.openai.com": ("chatgpt",),
+    "messenger.com": ("messenger",),
+    "github.com": ("github",),
+    "docs.google.com": ("google docs",),
+}
+
+_REUSABLE_LANDING_PATHS: set[str] = {
+    "",
+    "/direct",
+    "/direct/inbox",
+    "/mail",
+    "/mail/u/0",
+    "/channels/@me",
+    "/home",
+    "/feed",
+    "/messages",
+    "/inbox",
+}
+
+
+def _clean_visible_window_titles(titles: list[str], max_items: int = 12) -> list[str]:
+    """Filter system noise and own controller overlays from visible window titles."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in titles:
+        title = str(raw or "").strip()
+        if not title:
+            continue
+        lower = title.lower()
+        if lower in _WINDOW_TITLE_NOISE:
+            continue
+        if (
+            "window b - autonomous windows desktop controller" in lower
+            or "botcharacteroverlay" in lower
+        ):
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+        cleaned.append(title)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _infer_browser_stem_from_title(title: str, fallback: str = "firefox") -> str:
+    """Infer a Windows browser process stem from a browser window title."""
+    lower = title.lower()
+    if "firefox" in lower:
+        return "firefox"
+    if "edge" in lower:
+        return "msedge"
+    if "chrome" in lower:
+        return "chrome"
+    if "brave" in lower:
+        return "brave"
+    return fallback
+
+
+def find_matching_browser_window_title(
+    url: str,
+    visible_titles: list[str],
+    active_title: Optional[str] = None,
+) -> Optional[str]:
+    """Return an existing browser window title matching a landing URL, else None."""
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.query:
+        return None
+    normalized_path = parsed.path.rstrip("/").lower()
+    if normalized_path not in _REUSABLE_LANDING_PATHS:
+        return None
+
+    host = parsed.hostname.lower().removeprefix("www.")
+    is_known_site = host in _KNOWN_SITE_TITLE_KEYWORDS
+    if is_known_site:
+        keywords = _KNOWN_SITE_TITLE_KEYWORDS[host]
+    else:
+        parts = [p for p in host.split(".") if p]
+        non_tld = parts[:-1] if len(parts) > 1 else parts
+        filtered_parts = [p for p in non_tld if p not in {"www", "app", "web", "m", "mail", "open"}]
+        brand = filtered_parts[-1] if filtered_parts else (non_tld[-1] if non_tld else "")
+        if len(brand) < 4:
+            return None
+        keywords = (brand,)
+
+    candidates: list[str] = []
+    if active_title:
+        candidates.append(active_title)
+    candidates.extend(visible_titles)
+
+    for raw_title in candidates:
+        title = str(raw_title or "").strip()
+        if not title:
+            continue
+        lower = title.lower()
+        if "window b" in lower:
+            continue
+        if not any(marker in lower for marker in _BROWSER_WINDOW_MARKERS):
+            continue
+        if host == "youtube.com" and "youtube music" in lower:
+            continue
+        if is_known_site:
+            if any(kw in lower for kw in keywords):
+                return title
+        else:
+            if any(re.search(rf"\b{re.escape(kw)}\b", lower) for kw in keywords):
+                return title
+
+    return None
+
+
 class _Win32Rect(ctypes.Structure):
     _fields_ = [
         ("left", ctypes.c_long),
@@ -387,6 +532,64 @@ class BaseDesktopDriver(ABC):
     ) -> None:
         self.safety = safety
         self.speed_config = speed_config or SpeedConfig.from_preset(SpeedPreset.Normal)
+        self._cursor_lock = threading.Lock()
+        self._bot_controlling_mouse: bool = False
+        self._bot_target_pos: Optional[tuple[int, int]] = None
+        self._last_bot_move_pos: Optional[tuple[int, int]] = None
+        self._last_bot_move_time: float = 0.0
+
+    def begin_bot_pointer_action(self, target_xy: tuple[int, int]) -> None:
+        """Mark that the bot is actively driving the mouse toward target_xy."""
+        with self._cursor_lock:
+            self._bot_controlling_mouse = True
+            self._bot_target_pos = (int(target_xy[0]), int(target_xy[1]))
+
+    def record_bot_pointer_step(self, pos_xy: tuple[int, int]) -> None:
+        """Record an interpolated cursor step issued by the bot."""
+        with self._cursor_lock:
+            self._last_bot_move_pos = (int(pos_xy[0]), int(pos_xy[1]))
+            self._last_bot_move_time = time.monotonic()
+
+    def end_bot_pointer_action(self, final_xy: Optional[tuple[int, int]] = None) -> None:
+        """Mark completion of a bot mouse movement or click."""
+        with self._cursor_lock:
+            if final_xy is not None:
+                self._last_bot_move_pos = (int(final_xy[0]), int(final_xy[1]))
+                self._last_bot_move_time = time.monotonic()
+            self._bot_controlling_mouse = False
+            self._bot_target_pos = None
+
+    def get_bot_target_position(self) -> Optional[tuple[int, int]]:
+        """Return the active target coordinates if the bot is moving the mouse."""
+        with self._cursor_lock:
+            return self._bot_target_pos
+
+    def is_bot_driving_cursor(
+        self,
+        current_pos: Optional[tuple[int, int]] = None,
+        grace_sec: float = 0.35,
+    ) -> bool:
+        """Return True only when the cursor is moving under bot control (not human)."""
+        with self._cursor_lock:
+            if self._bot_controlling_mouse:
+                if current_pos is not None and self._last_bot_move_pos is not None:
+                    if (
+                        math.hypot(
+                            current_pos[0] - self._last_bot_move_pos[0],
+                            current_pos[1] - self._last_bot_move_pos[1],
+                        )
+                        > 120.0
+                    ):
+                        return False
+                return True
+            if self._last_bot_move_pos is not None and (time.monotonic() - self._last_bot_move_time) <= grace_sec:
+                if current_pos is None:
+                    return True
+                return (
+                    abs(current_pos[0] - self._last_bot_move_pos[0]) <= 12
+                    and abs(current_pos[1] - self._last_bot_move_pos[1]) <= 12
+                )
+            return False
 
     def _resolve_speed(self, speed_config: Optional[SpeedConfig] = None) -> SpeedConfig:
         return speed_config or self.speed_config
@@ -448,6 +651,10 @@ class BaseDesktopDriver(ABC):
         """Launch an application without elevation and return launch metadata."""
 
     @abstractmethod
+    def open_url(self, url: str, browser: str = "firefox") -> dict[str, Any]:
+        """Open an http(s) URL in a web browser and return launch metadata."""
+
+    @abstractmethod
     def verify_state(
         self,
         target_path: Optional[str] = None,
@@ -479,6 +686,8 @@ class MockDryRunDriver(BaseDesktopDriver):
         self.typed_texts: list[str] = []
         self.pressed_keys: list[list[str]] = []
         self.launched_apps: list[str] = []
+        self.opened_urls: list[str] = []
+        self.visible_window_titles: list[str] = []
         self.virtual_files: dict[str, str] = {}
         self.active_window_text: str = "Desktop Ready"
         self.step_callback = step_callback
@@ -529,12 +738,18 @@ class MockDryRunDriver(BaseDesktopDriver):
 
         path = compute_smooth_path(self.cursor_pos, (x, y), steps=cfg.interpolation_steps)
         total = len(path)
-        for idx, (px, py) in enumerate(path):
-            if self.step_callback is not None:
-                self.step_callback((px, py), idx, total)
-            self.safety.assert_can_execute(px, py, sw, sh)
-            self.cursor_pos = (px, py)
-            self.move_history.append((px, py))
+        self.begin_bot_pointer_action((x, y))
+        self.record_bot_pointer_step(self.cursor_pos)
+        try:
+            for idx, (px, py) in enumerate(path):
+                if self.step_callback is not None:
+                    self.step_callback((px, py), idx, total)
+                self.safety.assert_can_execute(px, py, sw, sh)
+                self.record_bot_pointer_step((px, py))
+                self.cursor_pos = (px, py)
+                self.move_history.append((px, py))
+        finally:
+            self.end_bot_pointer_action((x, y))
 
         self.action_history.append({"action": "move", "x": x, "y": y, "steps": len(path)})
         return path
@@ -607,6 +822,40 @@ class MockDryRunDriver(BaseDesktopDriver):
             "mock": True,
         }
         self.action_history.append({"action": "launch_app", **info})
+        return info
+
+    def open_url(self, url: str, browser: str = "firefox") -> dict[str, Any]:
+        sw, sh = self.screen_size
+        self.safety.assert_can_execute(self.cursor_pos[0], self.cursor_pos[1], sw, sh)
+        matched = find_matching_browser_window_title(
+            url,
+            self.visible_window_titles,
+            active_title=self.active_window_text,
+        )
+        if matched is not None:
+            self.active_window_text = matched
+            info = {
+                "url": url,
+                "browser": browser,
+                "focus_confirmed": True,
+                "reused_existing_window": True,
+                "matched_window_title": matched,
+                "mock": True,
+            }
+            self.action_history.append({"action": "open_url", **info})
+            return info
+        self.launched_apps.append(browser)
+        self.opened_urls.append(url)
+        self.typed_texts.append(url)
+        self.active_window_text = f"{url} — {browser}"
+        info = {
+            "url": url,
+            "browser": browser,
+            "focus_confirmed": True,
+            "reused_existing_window": False,
+            "mock": True,
+        }
+        self.action_history.append({"action": "open_url", **info})
         return info
 
     def verify_state(
@@ -720,17 +969,22 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
 
         path = compute_smooth_path(start, (x, y), steps=cfg.interpolation_steps)
         step_delay = cfg.move_duration_sec / max(len(path), 1)
+        self.begin_bot_pointer_action((x, y))
+        self.record_bot_pointer_step(start)
         try:
             for px, py in path:
                 actual_x, actual_y = self.get_cursor_position()
                 self._poll_hotkeys_and_safety(actual_x, actual_y, sw, sh)
                 self._poll_hotkeys_and_safety(px, py, sw, sh)
+                self.record_bot_pointer_step((px, py))
                 self._pyautogui.moveTo(px, py, duration=0, _pause=False)
                 if step_delay > 0:
                     time.sleep(step_delay)
         except self._pyautogui.FailSafeException as exc:
             self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during move_to") from exc
+        finally:
+            self.end_bot_pointer_action((x, y))
         return path
 
     def click(
@@ -745,6 +999,8 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         self.move_to(x, y, speed_config=cfg)
         sw, sh = self.get_screen_size()
         self._poll_hotkeys_and_safety(x, y, sw, sh)
+        self.begin_bot_pointer_action((x, y))
+        self.record_bot_pointer_step((x, y))
         try:
             if double:
                 self._pyautogui.doubleClick(x=x, y=y, button=button, _pause=False)
@@ -753,22 +1009,48 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         except self._pyautogui.FailSafeException as exc:
             self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
             raise EmergencyStopError("PyAutoGUI corner failsafe triggered during click") from exc
+        finally:
+            self.end_bot_pointer_action((x, y))
         if cfg.post_action_delay_sec > 0:
             self._poll_hotkeys_and_safety(x, y, sw, sh)
             time.sleep(cfg.post_action_delay_sec)
 
     def type_text(self, text: str, interval: float = 0.02) -> None:
         self._poll_hotkeys_and_safety()
-        step_interval = max(0.0, float(interval))
-        try:
-            for ch in text:
+        has_non_ascii = any(ord(ch) > 127 for ch in text)
+        if has_non_ascii:
+            import pyperclip
+
+            prev_clip: Optional[str] = None
+            try:
+                prev_clip = pyperclip.paste()
+            except Exception:
+                prev_clip = None
+            try:
+                pyperclip.copy(text)
                 self._poll_hotkeys_and_safety()
-                self._pyautogui.write(ch, interval=0, _pause=False)
-                if step_interval > 0:
-                    time.sleep(step_interval)
-        except self._pyautogui.FailSafeException as exc:
-            self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
-            raise EmergencyStopError("PyAutoGUI corner failsafe triggered during type_text") from exc
+                self._pyautogui.hotkey("ctrl", "v", _pause=False)
+                time.sleep(0.05)
+            except self._pyautogui.FailSafeException as exc:
+                self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
+                raise EmergencyStopError("PyAutoGUI corner failsafe triggered during type_text") from exc
+            finally:
+                if prev_clip is not None:
+                    try:
+                        pyperclip.copy(prev_clip)
+                    except Exception:
+                        pass
+        else:
+            step_interval = max(0.0, float(interval))
+            try:
+                for ch in text:
+                    self._poll_hotkeys_and_safety()
+                    self._pyautogui.write(ch, interval=0, _pause=False)
+                    if step_interval > 0:
+                        time.sleep(step_interval)
+            except self._pyautogui.FailSafeException as exc:
+                self.safety.trigger_emergency_stop(StopSource.corner_failsafe.value)
+                raise EmergencyStopError("PyAutoGUI corner failsafe triggered during type_text") from exc
         if self.speed_config.post_action_delay_sec > 0:
             self._poll_hotkeys_and_safety()
             time.sleep(self.speed_config.post_action_delay_sec)
@@ -837,7 +1119,14 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
         self._poll_hotkeys_and_safety()
         resolved_exe = _resolve_app_executable(app_name)
         cmd = [resolved_exe, *(args or [])]
-        proc = subprocess.Popen(cmd, shell=False)
+        try:
+            proc = subprocess.Popen(cmd, shell=False)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Desktop app {app_name!r} was not found on Windows (WinError 2). "
+                f"Do NOT call request_approval — if {app_name!r} is a website or web service, "
+                "use action_type='open_url' with its https:// URL instead."
+            ) from exc
         time.sleep(0.5)
         stem = Path(resolved_exe).stem or Path(app_name).stem
         self._last_launched_stem = stem
@@ -867,6 +1156,88 @@ class LiveWindowsDesktopDriver(BaseDesktopDriver):
             "pid": proc.pid,
             "rect": rect,
             "focus_confirmed": focus_confirmed,
+            "mock": False,
+        }
+
+    def open_url(self, url: str, browser: str = "firefox") -> dict[str, Any]:
+        self._poll_hotkeys_and_safety()
+        clean_url = url.strip()
+        lower_url = clean_url.lower()
+        if not (lower_url.startswith("http://") or lower_url.startswith("https://")):
+            raise ValueError(f"Unsupported URL scheme for open_url: {url!r}")
+
+        matched_title = find_matching_browser_window_title(
+            clean_url,
+            _list_visible_window_titles(),
+            active_title=_get_foreground_window_title(),
+        )
+        if matched_title is not None:
+            rect, focus_confirmed = _focus_window_by_title(matched_title, maximize=True)
+            inferred = _infer_browser_stem_from_title(
+                matched_title,
+                fallback=(browser.strip().lower() or "firefox"),
+            )
+            self._last_launched_stem = inferred
+            self._last_launched_pid = None
+            return {
+                "url": clean_url,
+                "browser": inferred,
+                "pid": None,
+                "rect": rect,
+                "focus_confirmed": focus_confirmed,
+                "reused_existing_window": True,
+                "matched_window_title": matched_title,
+                "mock": False,
+            }
+
+        candidates: list[str] = []
+        for b in (browser.strip().lower() or "firefox", "firefox", "msedge", "chrome"):
+            if b and b not in candidates:
+                candidates.append(b)
+
+        resolved_exe: Optional[str] = None
+        chosen_browser = candidates[0]
+        for b in candidates:
+            candidate = _resolve_app_executable(b)
+            if (candidate != b and Path(candidate).is_file()) or shutil.which(candidate) is not None:
+                resolved_exe = candidate
+                chosen_browser = b
+                break
+
+        pid: Optional[int] = None
+        rect: Optional[tuple[int, int, int, int]] = None
+        focus_confirmed = False
+        if resolved_exe is not None:
+            proc = subprocess.Popen([resolved_exe, clean_url], shell=False)
+            pid = proc.pid
+            time.sleep(0.6)
+            stem = Path(resolved_exe).stem or chosen_browser
+            self._last_launched_stem = stem
+            self._last_launched_pid = pid
+            rect, focus_confirmed = _focus_window_by_title(
+                stem,
+                target_pid=pid,
+                maximize=True,
+            )
+            if not focus_confirmed and stem.lower() == "msedge":
+                rect, focus_confirmed = _focus_window_by_title(
+                    "edge",
+                    target_pid=pid,
+                    maximize=True,
+                )
+        elif os.name == "nt":
+            os.startfile(clean_url)  # type: ignore[attr-defined]
+            time.sleep(0.6)
+        else:
+            raise FileNotFoundError(f"No supported web browser executable found for {clean_url!r}")
+
+        return {
+            "url": clean_url,
+            "browser": chosen_browser,
+            "pid": pid,
+            "rect": rect,
+            "focus_confirmed": focus_confirmed,
+            "reused_existing_window": False,
             "mock": False,
         }
 

@@ -33,7 +33,7 @@ class TestEnvironmentSetup:
 class TestActionSchema:
     """Strict validation tests for all 12 DesktopAction types and SpeedConfig."""
 
-    def test_action_type_enum_has_12_members(self) -> None:
+    def test_action_type_enum_has_15_members(self) -> None:
         expected = {
             "click",
             "double_click",
@@ -43,14 +43,20 @@ class TestActionSchema:
             "scroll",
             "wait",
             "launch_app",
+            "open_url",
             "verify_state",
+            "view_region",
+            "view_screen",
             "request_approval",
             "done",
             "fail",
         }
-        assert len(ActionType) == 12
+        assert len(ActionType) == 15
         assert {member.value for member in ActionType} == expected
         assert ActionType.CLICK is ActionType.click
+        assert ActionType.OPEN_URL is ActionType.open_url
+        assert ActionType.VIEW_REGION is ActionType.view_region
+        assert ActionType.VIEW_SCREEN is ActionType.view_screen
 
     @pytest.mark.parametrize(
         "payload",
@@ -73,6 +79,11 @@ class TestActionSchema:
             {"action_type": "wait", "description": "Wait for UI", "seconds": 1.5},
             {"action_type": "launch_app", "description": "Launch Notepad", "app_name": "notepad"},
             {
+                "action_type": "open_url",
+                "description": "Open Instagram DM inbox",
+                "url": "https://www.instagram.com/direct/inbox/",
+            },
+            {
                 "action_type": "verify_state",
                 "description": "Verify window title",
                 "expected_text": "Untitled - Notepad",
@@ -81,6 +92,18 @@ class TestActionSchema:
                 "action_type": "verify_state",
                 "description": "Verify file exists",
                 "target_path": r"C:\approved\note.txt",
+            },
+            {
+                "action_type": "view_region",
+                "description": "Zoom into player bar",
+                "left": 100,
+                "top": 200,
+                "right": 600,
+                "bottom": 500,
+            },
+            {
+                "action_type": "view_screen",
+                "description": "Reset to full desktop view",
             },
             {
                 "action_type": "request_approval",
@@ -117,7 +140,56 @@ class TestActionSchema:
             {"action_type": "wait", "description": "Negative seconds", "seconds": -0.1},
             {"action_type": "wait", "description": "Missing seconds"},
             {"action_type": "launch_app", "description": "Blank app", "app_name": "  "},
+            {"action_type": "open_url", "description": "Missing url"},
+            {
+                "action_type": "open_url",
+                "description": "Disallowed file URL",
+                "url": "file:///C:/Windows/win.ini",
+            },
+            {
+                "action_type": "open_url",
+                "description": "Disallowed javascript URL",
+                "url": "javascript:alert(1)",
+            },
+            {
+                "action_type": "open_url",
+                "description": "URL containing whitespace",
+                "url": "https://example.com/foo bar",
+            },
             {"action_type": "verify_state", "description": "Missing verification target"},
+            {"action_type": "view_region", "description": "Missing bounds", "left": 10, "top": 10},
+            {
+                "action_type": "view_region",
+                "description": "Inverted bounds",
+                "left": 500,
+                "top": 100,
+                "right": 400,
+                "bottom": 300,
+            },
+            {
+                "action_type": "view_region",
+                "description": "Too narrow span",
+                "left": 100,
+                "top": 100,
+                "right": 110,
+                "bottom": 200,
+            },
+            {
+                "action_type": "view_region",
+                "description": "Out of range bound > 1000",
+                "left": 100,
+                "top": 100,
+                "right": 1001,
+                "bottom": 400,
+            },
+            {
+                "action_type": "view_region",
+                "description": "Negative bound",
+                "left": -1,
+                "top": 100,
+                "right": 300,
+                "bottom": 400,
+            },
             {"action_type": "request_approval", "description": "Missing reason", "reason": "  "},
             {"action_type": "fail", "description": "Missing fail reason"},
             {"action_type": "done", "description": "   "},

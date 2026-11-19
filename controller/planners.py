@@ -21,33 +21,53 @@ from controller.schema import ActionType, DesktopAction
 
 _SYSTEM_INSTRUCTION = (
     "You are an autonomous Windows desktop planner. Respond ONLY with a single JSON object "
-    "matching the DesktopAction schema: {action_type, description, x, y, mark_id, text, keys, clicks, "
-    "seconds, app_name, target_path, expected_text, reason, risk_category}. "
+    "matching the DesktopAction schema: {action_type, description, x, y, left, top, right, bottom, "
+    "mark_id, text, keys, clicks, seconds, app_name, url, target_path, expected_text, reason, risk_category}. "
     "Valid action_type values: click, double_click, move, type_text, press_keys, scroll, wait, "
-    "launch_app, verify_state, request_approval, done, fail. "
-    "COORDINATES: Every screenshot uses a normalized 0..1000 coordinate grid regardless of actual screen pixels: "
-    "top-left=(0,0), center=(500,500), bottom-right=(1000,1000). Always return x and y in [0, 1000] aimed at the "
-    "visual center of the target control (no mark_id needed unless som_marks is provided). "
-    "Use bare application names in launch_app (e.g. 'firefox', 'msedge', 'chrome', 'notepad', 'calc'). "
+    "launch_app, open_url, verify_state, view_region, view_screen, request_approval, done, fail. "
+    "COORDINATES: Every screenshot is a clean image on a normalized 0..1000 coordinate grid regardless of "
+    "actual screen pixels: top-left=(0,0), center=(500,500), bottom-right=(1000,1000). NEVER output raw screen "
+    "pixels like 1920 or 1080—always return x, y, left, top, right, bottom in [0, 1000] aimed at the visual "
+    "center of the target control in the CURRENT image. "
+    "TARGETING & ZOOM: "
+    "(1) If ui_elements lists the exact control you want (id, role, name, center), prefer clicking it with "
+    "mark_id: <id> (exact Windows UI Automation target). "
+    "(2) If a target button or input is small, crowded, or missing from ui_elements, call view_region with "
+    "left, top, right, bottom (in 0..1000) to zoom into that area cleanly, then click inside the zoomed "
+    "0..1000 frame! Call view_screen to reset back to the full desktop image. "
+    "TASK PLAN & WEB APPS: When task_plan is provided in Observation, follow its strategy, starting_url, and steps! "
+    "Use action_type='open_url' with url='https://...' to open websites or web services (Instagram, YouTube Music, "
+    "YouTube, Gmail, Discord Web, Reddit, X, Spotify Web) directly in one step—NEVER call launch_app for websites. "
+    "TAB & WINDOW REUSE: Before calling open_url or launch_app, check the current screenshot, active_window_title, "
+    "and visible_window_titles. If the target website (e.g. Instagram) is ALREADY visible on screen, DO NOT call "
+    "open_url—work directly in the open tab. If the target website appears as an inactive tab in the browser's top "
+    "tab bar, CLICK that existing tab instead of calling open_url. Only call open_url when the target website is not "
+    "already open on screen/in the tab bar, is hidden in a background window, or needs a specific new search URL (?q=...). "
+    "If launch_app fails with WinError 2 (not found), NEVER call request_approval; switch immediately to open_url. "
+    "Use bare application names in launch_app only for installed Windows apps (e.g. 'firefox', 'msedge', 'chrome', 'notepad', 'calc'). "
     "All file writes and target_path values must stay inside approved_workspace; NEVER put a URL in target_path. "
-    "DIRECT SEARCH URLS: When searching or playing music/videos on YouTube Music or YouTube, NEVER go to the homepage "
-    "and guess search bar coordinates. Instead, press ['ctrl', 'l'], type_text the direct search URL "
-    "'https://music.youtube.com/search?q=<url_encoded_query>', and press ['enter']! "
-    "To open a website or web app in a browser: "
-    "(1) launch_app with app_name='firefox' (or 'msedge'/'chrome'), "
-    "(2) wait 2 seconds, "
-    "(3) press_keys ['ctrl', 'l'] to focus the address bar, "
-    "(4) type_text the full https://... URL, "
-    "(5) press_keys ['enter'], "
-    "(6) wait for the page to load, then interact via keyboard shortcuts or coordinates from the screenshot. "
-    "SELF-CORRECTION & CURSOR RETICLE: Each screenshot displays a red CURSOR (x,y) crosshair at your current cursor "
-    "position, coordinate ticks along the top/left edges, and a 1:1 ZOOM inset in the bottom-right corner around "
-    "the cursor for fine aiming. If you just launched an app and it is not in the foreground, click inside its window "
-    "to focus it like a human before typing or pressing shortcuts. Check screen_changed_last_step and last_error in the "
-    "Observation: if your previous click or typing did NOT change the screen (screen_changed_last_step is false) or "
-    "last_error warns of a repeated action/coordinate, DO NOT click the same (x, y) or repeat the same cycle—adjust "
-    "coordinates, use detected_ui_hints.youtube_music_play_button_xy if present, or use keyboard shortcuts "
-    "(Ctrl+L for URL bar, / for web search box, Space for play/pause). "
+    "DIRECT SEARCH URLS: When searching or playing music/videos on YouTube Music or YouTube, use open_url directly "
+    "with 'https://music.youtube.com/search?q=<url_encoded_query>' (or press ['ctrl', 'l'] if a browser is already open). "
+    "MESSAGING & RECIPIENT SAFETY: "
+    "(a) When opening a chat with a specific person, prefer clicking their matching mark_id from ui_elements; "
+    "if not listed, DO NOT guess a crowded contact row from the full screen—first call view_region on the contact "
+    "sidebar (e.g. left=0, top=150, right=300, bottom=900) OR use the chat Search box. "
+    "(b) CRITICAL BEFORE TYPING: Check the active conversation header at the top of the right chat pane and verify it "
+    "matches the intended recipient from task_text. If a DIFFERENT person's chat is open, DO NOT type or send—switch to "
+    "the correct recipient first. "
+    "(c) After typing a chat message into an input box (e.g. Instagram, Discord, WhatsApp), call press_keys ['enter'] "
+    "to send it instead of re-typing the same text. "
+    "(d) DO NOT SPAM OR REPEAT: Check recent_history and the visible chat bubbles before typing—never re-send a "
+    "greeting/message you already sent, and never type the recipient's username into the chat message box. "
+    "(e) WAITING FOR A REPLY: Call wait with seconds: 5 to 8 on the full-screen view (do NOT zoom into only the input "
+    "box, which hides incoming replies). Reply only after seeing a new incoming message, or call done once the task is complete. "
+    "SELF-CORRECTION: If you just launched an app and it is not in the foreground, click inside its window to focus "
+    "it before typing or pressing shortcuts. Check screen_changed_last_step and last_error in the Observation: "
+    "if your previous click or typing did NOT change the screen (screen_changed_last_step is false) or last_error "
+    "warns of a repeated action/coordinate, DO NOT click the same (x, y) or repeat the same cycle—zoom in with "
+    "view_region, pick a mark_id from ui_elements, adjust coordinates, use detected_ui_hints.youtube_music_play_button_xy "
+    "if present, or use keyboard shortcuts (Ctrl+L for URL bar, / for search box, Space for play/pause). "
+    "Keep description concise (one short sentence <= 120 chars; NEVER put chain-of-thought reasoning inside description). "
     "Only set reason and risk_category when action_type is 'request_approval' or 'fail'; leave them null for normal actions. "
     "Omit null/unused optional fields or set null."
 )
@@ -364,50 +384,235 @@ def scale_normalized_coord(value: int, target_size: int) -> int:
     return max(0, min(target_size - 1, int(round((clamped / 1000.0) * (target_size - 1)))))
 
 
-def _parse_action_json(raw_text: str) -> DesktopAction:
+def normalize_coord(pixel: int, target_size: int) -> int:
+    """Map a pixel offset in [0, target_size - 1] onto the normalized 0..1000 grid."""
+    if target_size < 2:
+        return 0
+    return max(0, min(1000, int(round((int(pixel) / float(target_size - 1)) * 1000.0))))
+
+
+def map_viewport_coord(
+    norm_x: int,
+    norm_y: int,
+    viewport: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Map normalized 0..1000 (x, y) inside viewport (left, top, right, bottom) to screen pixels."""
+    v_left, v_top, v_right, v_bottom = viewport
+    v_w = max(2, int(v_right) - int(v_left) + 1)
+    v_h = max(2, int(v_bottom) - int(v_top) + 1)
+    return (
+        int(v_left) + scale_normalized_coord(norm_x, v_w),
+        int(v_top) + scale_normalized_coord(norm_y, v_h),
+    )
+
+
+def normalize_to_viewport(
+    px: int,
+    py: int,
+    viewport: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Normalize screen pixel (px, py) to 0..1000 relative to viewport."""
+    v_left, v_top, v_right, v_bottom = viewport
+    v_w = max(2, int(v_right) - int(v_left) + 1)
+    v_h = max(2, int(v_bottom) - int(v_top) + 1)
+    return (
+        normalize_coord(int(px) - int(v_left), v_w),
+        normalize_coord(int(py) - int(v_top), v_h),
+    )
+
+
+def subregion_viewport(
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    parent_viewport: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Resolve normalized 0..1000 region bounds inside parent_viewport into screen pixel bounds."""
+    nl, nt = map_viewport_coord(left, top, parent_viewport)
+    nr, nb = map_viewport_coord(right, bottom, parent_viewport)
+    nr = max(nl + 1, min(int(parent_viewport[2]), nr))
+    nb = max(nt + 1, min(int(parent_viewport[3]), nb))
+    return (nl, nt, nr, nb)
+
+
+def crop_screenshot_to_viewport(
+    screenshot: Image.Image,
+    viewport: tuple[int, int, int, int],
+    screen_size: tuple[int, int],
+) -> Image.Image:
+    """Crop screenshot to screen-pixel viewport (left, top, right, bottom) with DPI scaling."""
+    img_w, img_h = screenshot.size
+    if img_w < 2 or img_h < 2:
+        return screenshot
+    sw = max(1, int(screen_size[0]))
+    sh = max(1, int(screen_size[1]))
+    v_left, v_top, v_right, v_bottom = viewport
+    scale_x = img_w / float(sw)
+    scale_y = img_h / float(sh)
+    il = max(0, min(img_w - 2, int(round(v_left * scale_x))))
+    it = max(0, min(img_h - 2, int(round(v_top * scale_y))))
+    ir = max(il + 2, min(img_w, int(round((v_right + 1) * scale_x))))
+    ib = max(it + 2, min(img_h, int(round((v_bottom + 1) * scale_y))))
+    return screenshot.crop((il, it, ir, ib))
+
+
+_ACTION_TYPE_ALIASES: dict[str, str] = {
+    "left_click": "click",
+    "move_mouse": "move",
+    "press_key": "press_keys",
+}
+
+
+def _coerce_optional_int(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    if isinstance(value, str):
+        try:
+            return int(round(float(value.strip())))
+        except ValueError:
+            return value
+    return value
+
+
+def _parse_action_json(
+    raw_text: str,
+    task_text: str = "",
+    active_window_title: Optional[str] = None,
+) -> DesktopAction:
     cleaned = _strip_json_fences(raw_text)
     try:
         data = json.loads(cleaned)
     except Exception:
         return DesktopAction.model_validate_json(cleaned)
     if isinstance(data, dict):
-        if not str(data.get("description") or "").strip():
-            at = str(data.get("action_type") or "action").strip()
-            data["description"] = f"Execute {at}"
-        if str(data.get("action_type") or "").lower() == "verify_state":
+        at_raw = str(data.get("action_type") or "").strip().lower()
+        at_norm = _ACTION_TYPE_ALIASES.get(at_raw, at_raw)
+        if at_norm:
+            data["action_type"] = at_norm
+
+        if at_norm == "press_keys" and not data.get("keys"):
+            raw_key = data.get("key")
+            raw_mods = data.get("modifiers")
+            synthesized: list[str] = []
+            if isinstance(raw_mods, list):
+                synthesized.extend(str(m).strip() for m in raw_mods if str(m).strip())
+            elif isinstance(raw_mods, str) and raw_mods.strip():
+                synthesized.append(raw_mods.strip())
+            if isinstance(raw_key, str) and raw_key.strip():
+                synthesized.append(raw_key.strip())
+            if synthesized:
+                data["keys"] = synthesized
+        elif isinstance(data.get("keys"), str) and data["keys"].strip():
+            data["keys"] = [data["keys"].strip()]
+
+        if at_norm == "scroll" and (data.get("clicks") is None or data.get("clicks") == 0):
+            direction = str(data.get("direction") or "down").strip().lower()
+            raw_amount = data.get("amount")
+            amt = 3
+            if raw_amount is not None and not isinstance(raw_amount, bool):
+                try:
+                    amt = max(1, min(100, int(round(float(raw_amount)))))
+                except (TypeError, ValueError):
+                    amt = 3
+            data["clicks"] = amt if direction == "up" else -amt
+
+        if at_norm == "wait" and data.get("seconds") is None:
+            raw_ms = data.get("milliseconds")
+            if raw_ms is not None and not isinstance(raw_ms, bool):
+                try:
+                    data["seconds"] = max(0.05, float(raw_ms) / 1000.0)
+                except (TypeError, ValueError):
+                    data["seconds"] = 1.0
+            else:
+                data["seconds"] = 1.0
+
+        if at_norm == "verify_state":
             if not data.get("expected_text") and not data.get("target_path"):
-                data["expected_text"] = " - YouTube Music"
-        return DesktopAction.model_validate(data)
+                if _is_youtube_music_task(task_text.lower()):
+                    data["expected_text"] = " - YouTube Music"
+                elif active_window_title and active_window_title.strip():
+                    data["expected_text"] = active_window_title.strip()
+
+        for int_field in ("x", "y", "left", "top", "right", "bottom", "mark_id", "clicks"):
+            if int_field in data:
+                data[int_field] = _coerce_optional_int(data[int_field])
+
+        desc = str(data.get("description") or "").strip()
+        if not desc:
+            desc = f"Execute {at_norm or 'action'}"
+        data["description"] = desc[:240].strip()
+
+        allowed_fields = set(DesktopAction.model_fields.keys())
+        filtered = {k: v for k, v in data.items() if k in allowed_fields}
+        return DesktopAction.model_validate(filtered)
     return DesktopAction.model_validate_json(cleaned)
 
 
-def _encode_screenshot_b64(screenshot: Optional[Image.Image]) -> Optional[str]:
+def _encode_screenshot_b64(
+    screenshot: Optional[Image.Image],
+    max_width: int = 1280,
+    quality: int = 78,
+) -> Optional[str]:
     if screenshot is None:
         return None
     img = screenshot
-    if img.width > 960:
-        new_h = max(1, int(round(img.height * (960.0 / img.width))))
-        img = img.resize((960, new_h), Image.Resampling.LANCZOS)
+    if img.width > max_width:
+        new_h = max(1, int(round(img.height * (float(max_width) / img.width))))
+        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=65)
+    img.convert("RGB").save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _build_observation_prompt(obs: ObservationContext) -> str:
-    payload = {
+    if obs.coordinates_normalized:
+        cursor_pos_norm = list(obs.cursor_pos)
+        active_rect_norm = list(obs.active_window_rect) if obs.active_window_rect else None
+        hints_norm = dict(obs.detected_ui_hints)
+    else:
+        full_vp = (0, 0, max(1, int(obs.screen_size[0]) - 1), max(1, int(obs.screen_size[1]) - 1))
+        cursor_pos_norm = list(normalize_to_viewport(obs.cursor_pos[0], obs.cursor_pos[1], full_vp))
+        if obs.active_window_rect is not None:
+            l, t, r, b = obs.active_window_rect
+            nl, nt = normalize_to_viewport(l, t, full_vp)
+            nr, nb = normalize_to_viewport(r, b, full_vp)
+            active_rect_norm = [nl, nt, nr, nb]
+        else:
+            active_rect_norm = None
+        hints_norm = dict(obs.detected_ui_hints)
+        yt_xy = hints_norm.get("youtube_music_play_button_xy")
+        if isinstance(yt_xy, (list, tuple)) and len(yt_xy) == 2:
+            hx, hy = normalize_to_viewport(int(yt_xy[0]), int(yt_xy[1]), full_vp)
+            hints_norm["youtube_music_play_button_xy"] = [hx, hy]
+
+    payload: dict[str, Any] = {
         "task_text": obs.task_text,
         "step_index": obs.step_index,
-        "screen_size": list(obs.screen_size),
-        "cursor_pos": list(obs.cursor_pos),
-        "active_window_rect": list(obs.active_window_rect) if obs.active_window_rect else None,
-        "active_window_title": obs.active_window_title,
-        "screen_changed_last_step": obs.screen_changed_last_step,
-        "som_marks": obs.som_marks,
-        "detected_ui_hints": obs.detected_ui_hints,
-        "approved_workspace": obs.approved_workspace,
-        "last_error": obs.last_error,
-        "recent_history": obs.history[-8:],
+        "coordinate_space": "normalized_0_to_1000_of_current_image",
+        "viewport_mode": obs.viewport_mode,
     }
+    if obs.active_region_normalized is not None:
+        payload["active_region_normalized"] = list(obs.active_region_normalized)
+    payload["cursor_pos"] = cursor_pos_norm
+    payload["active_window_rect"] = active_rect_norm
+    payload["active_window_title"] = obs.active_window_title
+    if obs.visible_window_titles:
+        payload["visible_window_titles"] = list(obs.visible_window_titles)
+    payload["screen_changed_last_step"] = obs.screen_changed_last_step
+    if obs.ui_elements:
+        payload["ui_elements"] = obs.ui_elements
+    if hints_norm:
+        payload["detected_ui_hints"] = hints_norm
+    if obs.task_plan is not None:
+        payload["task_plan"] = obs.task_plan
+    payload["approved_workspace"] = obs.approved_workspace
+    payload["last_error"] = obs.last_error
+    payload["recent_history"] = obs.history[-10:]
     return f"{_SYSTEM_INSTRUCTION}\n\nObservation:\n{json.dumps(payload)}"
 
 
@@ -420,12 +625,18 @@ class ObservationContext(BaseModel):
     cursor_pos: tuple[int, int] = (960, 540)
     active_window_rect: Optional[tuple[int, int, int, int]] = None
     active_window_title: Optional[str] = None
+    visible_window_titles: list[str] = Field(default_factory=list)
     screen_changed_last_step: Optional[bool] = None
     som_marks: dict[int, list[int]] = Field(default_factory=dict)
     detected_ui_hints: dict[str, Any] = Field(default_factory=dict)
     history: list[dict[str, Any]] = Field(default_factory=list)
     last_error: Optional[str] = None
     approved_workspace: str = str(APPROVED_WORKSPACE)
+    viewport_mode: str = "full"
+    active_region_normalized: Optional[list[int]] = None
+    ui_elements: list[dict[str, Any]] = Field(default_factory=list)
+    coordinates_normalized: bool = False
+    task_plan: Optional[dict[str, Any]] = None
 
 
 class BasePlanner(ABC):
@@ -479,7 +690,12 @@ class GeminiPlanner(BasePlanner):
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
         parts: list[dict[str, Any]] = [{"text": _build_observation_prompt(obs)}]
-        img_b64 = _encode_screenshot_b64(screenshot)
+        is_region = obs.viewport_mode == "region"
+        img_b64 = _encode_screenshot_b64(
+            screenshot,
+            max_width=960 if is_region else 1280,
+            quality=86 if is_region else 78,
+        )
         if img_b64:
             parts.append({"inlineData": {"mimeType": "image/jpeg", "data": img_b64}})
 
@@ -526,7 +742,11 @@ class GeminiPlanner(BasePlanner):
             break
 
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return _parse_action_json(raw_text)
+        return _parse_action_json(
+            raw_text,
+            task_text=obs.task_text,
+            active_window_title=obs.active_window_title,
+        )
 
 
 class OpenAIPlanner(BasePlanner):
@@ -564,7 +784,12 @@ class OpenAIPlanner(BasePlanner):
         user_content: list[dict[str, Any]] = [
             {"type": "text", "text": _build_observation_prompt(obs)}
         ]
-        img_b64 = _encode_screenshot_b64(screenshot)
+        is_region = obs.viewport_mode == "region"
+        img_b64 = _encode_screenshot_b64(
+            screenshot,
+            max_width=960 if is_region else 1280,
+            quality=86 if is_region else 78,
+        )
         if img_b64:
             user_content.append(
                 {
@@ -590,17 +815,21 @@ class OpenAIPlanner(BasePlanner):
         resp.raise_for_status()
         data = resp.json()
         raw_text = data["choices"][0]["message"]["content"]
-        return _parse_action_json(raw_text)
+        return _parse_action_json(
+            raw_text,
+            task_text=obs.task_text,
+            active_window_title=obs.active_window_title,
+        )
 
 
 class OllamaPlanner(BasePlanner):
-    """Local Ollama HTTP planner targeting http://localhost:11434."""
+    """Local Ollama HTTP planner targeting http://127.0.0.1:11434."""
 
     name: str = "Local Ollama"
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
+        base_url: str = "http://127.0.0.1:11434",
         model: str = "qwen3.5:latest",
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -626,8 +855,14 @@ class OllamaPlanner(BasePlanner):
             "format": "json",
             "stream": False,
             "think": False,
+            "options": {"temperature": 0.1},
         }
-        img_b64 = _encode_screenshot_b64(screenshot)
+        is_region = obs.viewport_mode == "region"
+        img_b64 = _encode_screenshot_b64(
+            screenshot,
+            max_width=960 if is_region else 1280,
+            quality=86 if is_region else 78,
+        )
         if img_b64:
             payload["images"] = [img_b64]
 
@@ -639,7 +874,11 @@ class OllamaPlanner(BasePlanner):
         resp.raise_for_status()
         data = resp.json()
         raw_text = data["response"]
-        return _parse_action_json(raw_text)
+        return _parse_action_json(
+            raw_text,
+            task_text=obs.task_text,
+            active_window_title=obs.active_window_title,
+        )
 
 
 _BROWSER_MEDIA_PATTERN = re.compile(
@@ -1132,4 +1371,8 @@ def create_planner(backend_name: str, api_key: Optional[str] = None) -> BasePlan
         return OpenAIPlanner(api_key=api_key)
     if normalized in {"local ollama", "ollama"}:
         return OllamaPlanner()
+    if normalized in {"antigravity + ollama", "antigravity", "hybrid"}:
+        planner = OllamaPlanner()
+        planner.name = "Antigravity + Ollama"
+        return planner
     raise ValueError(f"Unknown planner backend: {backend_name!r}")

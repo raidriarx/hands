@@ -5,8 +5,8 @@
 - **Deterministic Execution (`controller/engine.py`, `controller/policy.py`, `controller/emergency.py`, `controller/driver.py`)** validates, enforces safety & sandbox policy, logs to SQLite, and executes physical or mocked actions.
 
 ## 2. Core Data & Action Schema (`controller/schema.py`)
-- `ActionType(str, Enum)`: `click`, `double_click`, `move`, `type_text`, `press_keys`, `scroll`, `wait`, `launch_app`, `verify_state`, `request_approval`, `done`, `fail`.
-- `DesktopAction(BaseModel)` (`extra="forbid"`): `action_type`, `description` (plain English), optional `x`, `y`, `text`, `keys`, `clicks`, `seconds`, `app_name`, `target_path`, `expected_text`, `reason`, `risk_category`, with strict `@model_validator(mode="after")` validation per action type.
+- `ActionType(str, Enum)`: `click`, `double_click`, `move`, `type_text`, `press_keys`, `scroll`, `wait`, `launch_app`, `open_url`, `verify_state`, `view_region`, `view_screen`, `request_approval`, `done`, `fail`.
+- `DesktopAction(BaseModel)` (`extra="forbid"`): `action_type`, `description` (plain English), optional `x`, `y`, `left`, `top`, `right`, `bottom`, `mark_id`, `text`, `keys`, `clicks`, `seconds`, `app_name`, `url`, `target_path`, `expected_text`, `reason`, `risk_category`, with strict `@model_validator(mode="after")` validation per action type.
 - `SpeedPreset(str, Enum)`: `Slow`, `Normal`, `Fast`, `Custom`.
 - `SpeedConfig(BaseModel)`: `preset`, `move_duration_sec`, `pixels_per_second`, `post_action_delay_sec`, `interpolation_steps`.
 

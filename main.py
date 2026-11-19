@@ -12,7 +12,12 @@ from PySide6.QtWidgets import QApplication
 
 from controller.driver import create_driver
 from controller.emergency import SafetyController
-from controller.gui import MILESTONE_4_PRESET, DesktopControllerWindow
+from controller.gui import (
+    APPROVAL_MODE_ASK,
+    APPROVAL_MODE_SUPERVISED,
+    MILESTONE_4_PRESET,
+    DesktopControllerWindow,
+)
 from controller.planners import _load_dotenv_if_present
 from controller.schema import SpeedConfig
 
@@ -58,6 +63,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Automatically authorize and start the initial task 1 second after launching Window B.",
     )
+    parser.add_argument(
+        "--approval-mode",
+        choices=["ask", "supervised"],
+        default="ask",
+        help="Approval gate mode: 'ask' prompts on risky actions, 'supervised' auto-approves while keeping hard safety blocks.",
+    )
+    parser.add_argument(
+        "--supervised",
+        action="store_true",
+        help="Shortcut for --approval-mode supervised (auto-approve while user watches).",
+    )
     return parser
 
 
@@ -78,6 +94,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     (Path(__file__).resolve().parent / "approved_workspace").mkdir(parents=True, exist_ok=True)
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    args.task = " ".join(args.task.split())
+    args.backend = " ".join(args.backend.split())
 
     if args.headless_check:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -111,6 +129,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if stale_demo.exists():
             stale_demo.unlink()
 
+    approval_mode = (
+        APPROVAL_MODE_SUPERVISED
+        if (args.supervised or args.approval_mode == "supervised")
+        else APPROVAL_MODE_ASK
+    )
+
     window = DesktopControllerWindow(
         safety=safety,
         driver=driver,
@@ -119,6 +143,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         initial_task=task_text,
         auto_start_demo=bool((args.live_demo_notepad or args.auto_start) and not args.headless_check),
         initial_backend=args.backend,
+        initial_approval_mode=approval_mode,
     )
 
     if args.headless_check:
@@ -129,6 +154,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         window.close()
         return 0
 
+    print(
+        f"[DesktopController] Window B opened | backend={args.backend} | mode={approval_mode} | corner={window._current_corner}",
+        flush=True,
+    )
+    if window.auto_start_demo:
+        print(
+            f"[DesktopController] Auto-starting task in 1s: {task_text}",
+            flush=True,
+        )
     window.show()
     try:
         preview = driver.capture_screenshot()

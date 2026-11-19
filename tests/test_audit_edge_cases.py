@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -16,31 +19,59 @@ from PySide6.QtWidgets import QApplication, QLineEdit
 
 import controller.driver as driver_mod
 from controller.driver import (
+    BaseDesktopDriver,
     LiveWindowsDesktopDriver,
     MockDryRunDriver,
     _resolve_app_executable,
+    find_matching_browser_window_title,
     reconcile_dpi_coordinates,
 )
 from controller.emergency import SafetyController, SafetyGateError, EmergencyStopError
 from controller.engine import DesktopExecutionEngine
-from controller.gui import BotCharacterOverlay, BotFaceWidget, DesktopControllerWindow
+from controller.interpreter import (
+    AntigravityCLIInterpreter,
+    BasePlanInterpreter,
+    HybridPlanInterpreter,
+    OllamaPlanInterpreter,
+    TaskPlan,
+    _build_interpreter_prompt,
+)
+import main as app_main
+import controller.gui as gui_mod
+from controller.gui import (
+    APPROVAL_MODE_ASK,
+    APPROVAL_MODE_SUPERVISED,
+    BotCharacterOverlay,
+    BotFaceWidget,
+    DesktopControllerWindow,
+)
 from controller.planners import (
     BasePlanner,
     LocalDemoFallbackPlanner,
     ObservationContext,
+    OllamaPlanner,
+    _build_observation_prompt,
     _extract_song_query,
     _is_youtube_music_task,
+    _parse_action_json,
     annotate_screenshot_for_planner,
     compute_screenshot_change_ratio,
     create_foveated_screenshot,
+    create_planner,
+    crop_screenshot_to_viewport,
     extract_som_marks,
     locate_youtube_music_play_button,
+    map_viewport_coord,
+    normalize_coord,
+    normalize_to_viewport,
     save_api_key_to_dotenv,
     scale_normalized_coord,
+    subregion_viewport,
 )
 from controller.policy import PolicyEngine
 from controller.schema import ActionType, DesktopAction, SpeedConfig, SpeedPreset
 from controller.store import SQLiteAuditStore, redact_secrets
+from controller.uia import extract_priority_terms, prioritize_ui_elements
 
 
 class TestSchemaAuditBoundsAndNonFinite:
@@ -1016,3 +1047,1247 @@ class TestBrowserControlAndApiKeyUX:
         assert scale_normalized_coord(500, 1920) == 960
         assert scale_normalized_coord(1000, 1920) == 1919
         assert scale_normalized_coord(1000, 1080) == 1079
+
+    def test_viewport_coordinate_math_nested_zoom_and_dpi_crop(self) -> None:
+        assert normalize_coord(0, 1920) == 0
+        assert normalize_coord(960, 1920) == 500
+        assert normalize_coord(1919, 1920) == 1000
+
+        full_vp = (0, 0, 1919, 1079)
+        vp1 = subregion_viewport(200, 200, 600, 600, full_vp)
+        assert vp1 == (384, 216, 1151, 647)
+        assert map_viewport_coord(500, 500, vp1) == (768, 432)
+        norm_roundtrip = normalize_to_viewport(768, 432, vp1)
+        assert norm_roundtrip == (501, 501)
+        assert map_viewport_coord(*norm_roundtrip, vp1) == (768, 432)
+
+        # Level-2 nested zoom inside vp1
+        vp2 = subregion_viewport(250, 250, 750, 750, vp1)
+        assert vp2[0] > vp1[0] and vp2[1] > vp1[1]
+        assert vp2[2] < vp1[2] and vp2[3] < vp1[3]
+
+        # DPI-scaled screenshot (2880x1620 for 1920x1080 logical screen)
+        dpi_img = Image.new("RGB", (2880, 1620), (10, 20, 30))
+        cropped = crop_screenshot_to_viewport(dpi_img, vp1, (1920, 1080))
+        assert cropped.size == (1152, 648)
+
+    def test_policy_readonly_inspection_exempt_from_approval_but_still_sandboxes(self) -> None:
+        policy = PolicyEngine()
+        zoom_instagram = DesktopAction(
+            action_type=ActionType.view_region,
+            left=100,
+            top=200,
+            right=500,
+            bottom=600,
+            description="Zoom into Instagram DM message bar",
+        )
+        decision = policy.evaluate(zoom_instagram)
+        assert decision.allowed is True
+        assert decision.requires_approval is False
+        assert decision.risk_category == "safe"
+
+        reset_outlook = DesktopAction(
+            action_type=ActionType.view_screen,
+            description="Inspect Outlook window full screen",
+        )
+        reset_decision = policy.evaluate(reset_outlook)
+        assert reset_decision.allowed is True
+        assert reset_decision.requires_approval is False
+
+        blocked_system = DesktopAction(
+            action_type=ActionType.view_region,
+            left=0,
+            top=0,
+            right=400,
+            bottom=400,
+            description=r"Inspect C:\Windows\System32\cmd.exe",
+        )
+        assert policy.evaluate(blocked_system).allowed is False
+
+        blocked_runas = DesktopAction(
+            action_type=ActionType.view_screen,
+            description="Elevate via runas",
+        )
+        assert policy.evaluate(blocked_runas).allowed is False
+
+    def test_engine_view_region_click_auto_reset_and_zoom_depth_limit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _ZoomDriver(MockDryRunDriver):
+            def capture_screenshot(self) -> Image.Image:
+                img = Image.new("RGB", (1920, 1080), (10, 10, 10))
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([384, 216, 1152, 648], fill=(220, 40, 40))
+                return img
+
+        class _ZoomOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_obs: list[ObservationContext] = []
+                self.seen_sizes: list[tuple[int, int]] = []
+                self._calls = 0
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_obs.append(obs)
+                self.seen_sizes.append(screenshot.size if screenshot is not None else (0, 0))
+                idx = self._calls
+                self._calls += 1
+                if idx == 0:
+                    return DesktopAction(
+                        action_type=ActionType.view_region,
+                        left=200,
+                        top=200,
+                        right=600,
+                        bottom=600,
+                        description="Zoom level 1",
+                    )
+                if idx == 1:
+                    return DesktopAction(
+                        action_type=ActionType.view_region,
+                        left=100,
+                        top=100,
+                        right=900,
+                        bottom=900,
+                        description="Zoom level 2",
+                    )
+                if idx == 2:
+                    # 3rd consecutive zoom should trigger zoom depth guard retry
+                    return DesktopAction(
+                        action_type=ActionType.view_region,
+                        left=200,
+                        top=200,
+                        right=800,
+                        bottom=800,
+                        description="Zoom level 3 should retry",
+                    )
+                if idx == 3:
+                    return DesktopAction(
+                        action_type=ActionType.view_screen,
+                        description="Reset to full screen",
+                    )
+                if idx == 4:
+                    return DesktopAction(
+                        action_type=ActionType.view_region,
+                        left=200,
+                        top=200,
+                        right=600,
+                        bottom=600,
+                        description="Zoom target region",
+                    )
+                if idx == 5:
+                    return DesktopAction(
+                        action_type=ActionType.click,
+                        x=500,
+                        y=500,
+                        description="Click center of zoomed region",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Completed")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = _ZoomDriver(safety=safety)
+        planner = _ZoomOllamaPlanner()
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            uia_collector=lambda _vp, _ss: [],
+        )
+        res = engine.run_task("Zoom and click target")
+        assert res.status == "completed"
+        assert res.retries_used == 1
+        assert driver.get_cursor_position() == (768, 432)
+
+        assert planner.seen_obs[0].viewport_mode == "full"
+        assert planner.seen_sizes[0] == (1920, 1080)
+        assert planner.seen_obs[1].viewport_mode == "region"
+        assert planner.seen_sizes[1] == (768, 432)
+        assert planner.seen_obs[3].last_error and "Already zoomed in 2 levels" in planner.seen_obs[3].last_error
+        assert planner.seen_obs[4].viewport_mode == "full"
+        assert planner.seen_obs[5].viewport_mode == "region"
+        # After click, viewport auto-resets back to full for verification step
+        assert planner.seen_obs[6].viewport_mode == "full"
+        # AI history contains normalized coordinates, not raw pixel (768, 432)
+        assert any(
+            entry.get("verification") == "Clicked normalized (500, 500)"
+            for entry in planner.seen_obs[6].history
+        )
+
+    def test_build_observation_prompt_never_leaks_raw_pixels(self) -> None:
+        obs = ObservationContext(
+            task_text="open firefox and open youtube music and start playing juice wrld",
+            step_index=4,
+            screen_size=(1920, 1080),
+            cursor_pos=(1200, 700),
+            active_window_rect=(0, 0, 1919, 1079),
+            active_window_title="YouTube Music — Mozilla Firefox",
+            som_marks={1: [846, 516]},
+            detected_ui_hints={"youtube_music_play_button_xy": [441, 478]},
+            coordinates_normalized=False,
+        )
+        prompt = _build_observation_prompt(obs)
+        assert "Observation:\n" in prompt
+        obs_json = prompt.split("Observation:\n", 1)[1]
+        assert '"screen_size"' not in obs_json
+        assert "1920" not in obs_json
+        assert "1080" not in obs_json
+        assert "1200" not in obs_json
+        assert "700" not in obs_json
+        assert "846" not in obs_json
+        assert "441" not in obs_json
+        parsed_obs = json.loads(obs_json)
+        assert parsed_obs["coordinate_space"] == "normalized_0_to_1000_of_current_image"
+        assert parsed_obs["cursor_pos"] == [625, 649]
+        # 441 / 1919 * 1000 = 230, 478 / 1079 * 1000 = 443
+        assert parsed_obs["detected_ui_hints"]["youtube_music_play_button_xy"] == [230, 443]
+        assert "som_marks" not in parsed_obs
+
+    def test_uia_grounding_and_mark_id_precedence(self, tmp_path: Path) -> None:
+        uia_items = [
+            {
+                "id": 1,
+                "role": "Button",
+                "name": "Shuffle",
+                "rect": [820, 395, 920, 435],
+                "center": [870, 415],
+            }
+        ]
+
+        class _UIAOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_obs: list[ObservationContext] = []
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_obs.append(obs)
+                if obs.step_index == 0:
+                    return DesktopAction(
+                        action_type=ActionType.click,
+                        mark_id=1,
+                        x=100,
+                        y=100,
+                        description="Click Shuffle via mark_id",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Done")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        planner = _UIAOllamaPlanner()
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            uia_collector=lambda _vp, _ss: uia_items,
+        )
+        res = engine.run_task("Click Shuffle")
+        assert res.status == "completed"
+        assert planner.seen_obs[0].ui_elements == [
+            {"id": 1, "role": "Button", "name": "Shuffle", "center": [453, 385]}
+        ]
+        # mark_id=1 takes precedence over fallback (100, 100)
+        assert driver.get_cursor_position() == (870, 415)
+
+    def test_parse_action_json_handles_aliases_extra_fields_and_non_yt_verify(self) -> None:
+        act1 = _parse_action_json(
+            '{"action_type": "left_click", "x": 453.4, "y": "384.6", "marks": [{"mark_id": 1}], "description": ""}'
+        )
+        assert act1.action_type == ActionType.click
+        assert (act1.x, act1.y) == (453, 385)
+        assert act1.description == "Execute click"
+
+        act2 = _parse_action_json(
+            '{"action_type": "press_key", "key": "l", "modifiers": ["ctrl"], "description": "Focus URL"}'
+        )
+        assert act2.action_type == ActionType.press_keys
+        assert act2.keys == ["ctrl", "l"]
+
+        act3 = _parse_action_json(
+            '{"action_type": "verify_state", "description": "Verify Instagram"}',
+            task_text="send hi to friend on instagram",
+            active_window_title="Instagram — Mozilla Firefox",
+        )
+        assert act3.expected_text == "Instagram — Mozilla Firefox"
+
+        act4 = _parse_action_json('{"action_type": "wait", "milliseconds": 500}')
+        assert act4.action_type == ActionType.wait
+        assert act4.seconds == pytest.approx(0.5)
+
+        act5 = _parse_action_json('{"action_type": "scroll", "direction": "up", "amount": 4}')
+        assert act5.action_type == ActionType.scroll
+        assert act5.clicks == 4
+
+        long_desc = "A" * 400
+        act6 = _parse_action_json(f'{{"action_type": "done", "description": "{long_desc}"}}')
+        assert len(act6.description) == 240
+
+    def test_bot_character_overlay_exclude_from_capture(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        _ = QApplication.instance() or QApplication([])
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        overlay = BotCharacterOverlay(driver=driver)
+        assert overlay._apply_exclude_from_capture() is False
+
+        calls: list[tuple[int, int]] = []
+
+        def _fake_set_affinity(hwnd: int, affinity: int) -> int:
+            calls.append((hwnd, affinity))
+            return 1
+
+        monkeypatch.setattr(overlay, "_is_headless_or_test_mode", lambda: False)
+        monkeypatch.setattr(overlay, "winId", lambda: 123456)
+        fake_user32 = types.SimpleNamespace(SetWindowDisplayAffinity=_fake_set_affinity)
+        fake_windll = types.SimpleNamespace(user32=fake_user32)
+        monkeypatch.setattr(gui_mod.ctypes, "windll", fake_windll, raising=False)
+        monkeypatch.setattr(gui_mod.os, "name", "nt")
+
+        assert overlay._apply_exclude_from_capture() is True
+        assert calls == [(123456, 0x11)]
+        overlay.close()
+
+    def test_policy_open_url_and_wait_exempt_while_messaging_actions_require_approval(self) -> None:
+        policy = PolicyEngine()
+
+        nav_ig = DesktopAction(
+            action_type=ActionType.open_url,
+            url="https://www.instagram.com/direct/inbox/",
+            description="Open Instagram Direct Messages in Firefox",
+        )
+        nav_decision = policy.evaluate(nav_ig)
+        assert nav_decision.allowed is True
+        assert nav_decision.requires_approval is False
+        assert nav_decision.risk_category == "safe"
+
+        wait_ig = DesktopAction(
+            action_type=ActionType.wait,
+            seconds=2.0,
+            description="Wait for Instagram messages to load",
+        )
+        wait_decision = policy.evaluate(wait_ig)
+        assert wait_decision.allowed is True
+        assert wait_decision.requires_approval is False
+
+        type_ig = DesktopAction(
+            action_type=ActionType.type_text,
+            text="hi",
+            description="Type hi into Instagram message box",
+        )
+        type_decision = policy.evaluate(type_ig)
+        assert type_decision.allowed is True
+        assert type_decision.requires_approval is True
+        assert type_decision.risk_category == "social_post"
+
+        risky_url = DesktopAction(
+            action_type=ActionType.open_url,
+            url="https://example.com/downloads/setup.exe",
+            description="Open downloaded installer link",
+        )
+        risky_decision = policy.evaluate(risky_url)
+        assert risky_decision.allowed is True
+        assert risky_decision.requires_approval is True
+        assert risky_decision.risk_category == "install_or_execute"
+
+    def test_antigravity_cli_interpreter_and_hybrid_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured_cmds: list[list[str]] = []
+        inner_plan = {
+            "intent_summary": "Open Instagram DMs and message My Goldfish",
+            "strategy": "web_browser",
+            "starting_url": "https://www.instagram.com/direct/inbox/",
+            "desktop_app": None,
+            "steps": [
+                "Use open_url to navigate to https://www.instagram.com/direct/inbox/.",
+                "Click the conversation with My Goldfish.",
+                "Type hi and send after user approval.",
+            ],
+            "success_criteria": "Message hi sent to My Goldfish.",
+        }
+        envelope = {"status": "SUCCESS", "response": json.dumps(inner_plan)}
+
+        def _fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(envelope), stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        cli = AntigravityCLIInterpreter(executable=r"C:\fake\agy.exe", timeout_sec=35.0)
+        plan = cli.interpret_task('open instagram and text My Goldfish "hi"')
+        assert plan.strategy == "web_browser"
+        assert plan.starting_url == "https://www.instagram.com/direct/inbox/"
+        assert plan.source == "antigravity_cli"
+        assert len(plan.steps) == 3
+        assert "--json-schema" not in captured_cmds[0]
+        assert "--effort" not in captured_cmds[0]
+
+        class _FailingPrimary(AntigravityCLIInterpreter):
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def interpret_task(
+                self,
+                task_text: str,
+                *,
+                failure_context: Optional[str] = None,
+                active_window_title: Optional[str] = None,
+            ) -> TaskPlan:
+                raise RuntimeError("agy temporary failure")
+
+        class _FallbackOllama(OllamaPlanInterpreter):
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def interpret_task(
+                self,
+                task_text: str,
+                *,
+                failure_context: Optional[str] = None,
+                active_window_title: Optional[str] = None,
+            ) -> TaskPlan:
+                return TaskPlan(
+                    intent_summary="Fallback web plan",
+                    strategy="web_browser",
+                    starting_url="https://www.instagram.com",
+                    desktop_app=None,
+                    steps=["Open Instagram via open_url."],
+                    success_criteria="Instagram open",
+                    source="ollama",
+                )
+
+        hybrid = HybridPlanInterpreter(primary=_FailingPrimary(), fallback=_FallbackOllama())
+        fallback_plan = hybrid.interpret_task("open instagram")
+        assert fallback_plan.source == "ollama"
+        assert fallback_plan.starting_url == "https://www.instagram.com"
+
+    def test_engine_uses_plan_interpreter_open_url_and_adaptive_replan_on_winerror2(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _RecordingInterpreter(AntigravityCLIInterpreter):
+            def __init__(self) -> None:
+                super().__init__(executable=r"C:\fake\agy.exe")
+                self.calls: list[Optional[str]] = []
+
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def interpret_task(
+                self,
+                task_text: str,
+                *,
+                failure_context: Optional[str] = None,
+                active_window_title: Optional[str] = None,
+            ) -> TaskPlan:
+                self.calls.append(failure_context)
+                if failure_context:
+                    return TaskPlan(
+                        intent_summary="Switch to web browser for Instagram",
+                        strategy="web_browser",
+                        starting_url="https://www.instagram.com/direct/inbox/",
+                        desktop_app=None,
+                        steps=["Use open_url to open https://www.instagram.com/direct/inbox/."],
+                        success_criteria="Instagram inbox open",
+                        source="antigravity_cli",
+                    )
+                return TaskPlan(
+                    intent_summary="Open Instagram",
+                    strategy="hybrid",
+                    starting_url="https://www.instagram.com",
+                    desktop_app="instagram",
+                    steps=["Open Instagram"],
+                    success_criteria="Instagram open",
+                    source="antigravity_cli",
+                )
+
+        class _WinError2Driver(MockDryRunDriver):
+            def launch_app(
+                self,
+                app_name: str,
+                args: Optional[list[str]] = None,
+            ) -> dict[str, object]:
+                if app_name.lower() == "instagram":
+                    raise FileNotFoundError(
+                        "Desktop app 'instagram' was not found on Windows (WinError 2)."
+                    )
+                return super().launch_app(app_name, args=args)
+
+        class _AdaptiveOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_plans: list[Optional[dict[str, object]]] = []
+                self._calls = 0
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_plans.append(obs.task_plan)
+                idx = self._calls
+                self._calls += 1
+                if idx == 0:
+                    return DesktopAction(
+                        action_type=ActionType.launch_app,
+                        app_name="instagram",
+                        description="Try launching Instagram app",
+                    )
+                if idx == 1:
+                    assert obs.task_plan is not None
+                    url = str(obs.task_plan["starting_url"])
+                    return DesktopAction(
+                        action_type=ActionType.open_url,
+                        url=url,
+                        description="Open Instagram DMs in browser",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Instagram opened")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = _WinError2Driver(safety=safety)
+        store = SQLiteAuditStore(tmp_path / "interpreter_replan.db")
+        interpreter = _RecordingInterpreter()
+        planner = _AdaptiveOllamaPlanner()
+
+        approval_calls: list[str] = []
+
+        def _approve_once(action: DesktopAction, _dec: object) -> bool:
+            approval_calls.append(action.action_type.value)
+            return True
+
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            approval_callback=_approve_once,
+            uia_collector=lambda _vp, _ss: [],
+            plan_interpreter=interpreter,
+        )
+        res = engine.run_task("open instagram")
+        assert res.status == "completed"
+        assert "launch_app" in approval_calls
+        assert "open_url" not in approval_calls
+        assert res.retries_used == 1
+        assert interpreter.calls[0] is None
+        assert interpreter.calls[1] and "WinError 2" in interpreter.calls[1]
+        assert "https://www.instagram.com/direct/inbox/" in driver.opened_urls
+        assert planner.seen_plans[0] is not None
+        assert planner.seen_plans[1] is not None
+        assert planner.seen_plans[1]["starting_url"] == "https://www.instagram.com/direct/inbox/"
+
+        logged = store.get_actions_for_run(res.run_id)
+        interp_logs = [row for row in logged if row["action_type"] == "plan_interpreter"]
+        assert [row["status"] for row in interp_logs] == ["ok", "replanned"]
+
+    def test_ollama_loopback_default_antigravity_factory_and_gui_status(self) -> None:
+        assert OllamaPlanner().base_url == "http://127.0.0.1:11434"
+        hybrid_planner = create_planner("Antigravity + Ollama")
+        assert isinstance(hybrid_planner, OllamaPlanner)
+        assert hybrid_planner.name == "Antigravity + Ollama"
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        app = QApplication.instance() or QApplication([])
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+        assert win.backend_combo.findText("Antigravity + Ollama") >= 0
+        win.backend_combo.setCurrentText("Antigravity + Ollama")
+        assert "Antigravity + Ollama" in win.backend_status_label.text()
+        win.close()
+        app.processEvents()
+
+    def test_live_driver_unicode_clipboard_typing_and_helpful_winerror2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        copied: list[str] = []
+        hotkeys: list[tuple[str, ...]] = []
+        fake_pyperclip = types.SimpleNamespace(
+            paste=lambda: "old clipboard",
+            copy=lambda val: copied.append(str(val)),
+        )
+        monkeypatch.setitem(sys.modules, "pyperclip", fake_pyperclip)
+
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = LiveWindowsDesktopDriver(safety=safety)
+        monkeypatch.setattr(driver, "_poll_hotkeys_and_safety", lambda *a, **k: None)
+        monkeypatch.setattr(
+            driver._pyautogui,
+            "hotkey",
+            lambda *args, **_kwargs: hotkeys.append(tuple(str(a) for a in args)),
+        )
+        monkeypatch.setattr("controller.driver.time.sleep", lambda _s: None)
+
+        driver.type_text("hi 👋 สวัสดี")
+        assert copied == ["hi 👋 สวัสดี", "old clipboard"]
+        assert hotkeys == [("ctrl", "v")]
+
+        def _missing_exe(*_args: object, **_kwargs: object) -> object:
+            raise FileNotFoundError(2, "The system cannot find the file specified", "instagram")
+
+        monkeypatch.setattr(subprocess, "Popen", _missing_exe)
+        with pytest.raises(FileNotFoundError) as exc_info:
+            driver.launch_app("instagram")
+        assert "open_url" in str(exc_info.value)
+        assert "Do NOT call request_approval" in str(exc_info.value)
+
+    def test_supervised_auto_approve_allows_risky_without_prompt_but_blocks_escalation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _SupervisedPlanner(BasePlanner):
+            name = "SupervisedPlanner"
+
+            def __init__(self, actions: list[DesktopAction]) -> None:
+                self._actions = actions
+
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                idx = min(obs.step_index, len(self._actions) - 1)
+                return self._actions[idx]
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        store = SQLiteAuditStore(tmp_path / "supervised.db")
+
+        approval_called = False
+
+        def _should_not_be_called(_act: DesktopAction, _dec: object) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return False
+
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=_SupervisedPlanner(
+                [
+                    DesktopAction(
+                        action_type=ActionType.type_text,
+                        text="hi",
+                        description="Type hi into Instagram DM",
+                    ),
+                    DesktopAction(action_type=ActionType.done, description="Message sent"),
+                ]
+            ),
+            approval_callback=_should_not_be_called,
+            auto_approve_supervised=True,
+        )
+        res = engine.run_task("text My Goldfish hi")
+        assert res.status == "completed"
+        assert approval_called is False
+        assert "hi" in driver.typed_texts
+        rows = store.get_actions_for_run(res.run_id)
+        assert rows[0]["approval_status"] == "auto_approved"
+
+        # Hard blocks (privilege escalation / outside sandbox) stay blocked even in supervised mode
+        safety2 = SafetyController()
+        safety2.authorize_start()
+        engine_blocked = DesktopExecutionEngine(
+            driver=MockDryRunDriver(safety=safety2),
+            safety=safety2,
+            store=store,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=_SupervisedPlanner(
+                [
+                    DesktopAction(
+                        action_type=ActionType.launch_app,
+                        app_name="runas",
+                        description="Escalate privileges",
+                    )
+                ]
+            ),
+            auto_approve_supervised=True,
+        )
+        res_blocked = engine_blocked.run_task("Run elevated command")
+        assert res_blocked.status == "failed"
+        assert "privilege" in (res_blocked.error or "").lower()
+
+    def test_driver_bot_vs_human_cursor_ownership(self) -> None:
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        assert driver.is_bot_driving_cursor() is False
+
+        driver.begin_bot_pointer_action((1750, 120))
+        driver.record_bot_pointer_step((1700, 130))
+        assert driver.is_bot_driving_cursor((1705, 132)) is True
+        assert driver.get_bot_target_position() == (1750, 120)
+
+        # Human yanks mouse >120px away mid-move -> no longer bot-driven
+        assert driver.is_bot_driving_cursor((400, 700)) is False
+
+        driver.end_bot_pointer_action((1750, 120))
+        assert driver.get_bot_target_position() is None
+        # Within grace_sec right at final bot spot -> True, but if human moved >12px -> False
+        assert driver.is_bot_driving_cursor((1750, 120), grace_sec=1.0) is True
+        assert driver.is_bot_driving_cursor((1700, 120), grace_sec=1.0) is False
+
+    def test_compact_corner_ui_dodges_bot_cursor_but_stays_still_for_human(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        app = QApplication.instance() or QApplication([])
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(
+            safety=safety,
+            driver=driver,
+            initial_approval_mode=APPROVAL_MODE_SUPERVISED,
+        )
+        assert win.width() <= 420 and win.height() <= 600
+        assert win._current_corner == "top_right"
+        assert win.is_supervised_mode() is True
+
+        win.set_compact_mode(True)
+        assert win._compact_mode is True
+        assert win.width() <= 340 and win.height() <= 140
+        assert win.compact_toggle_button.text() == "Expand"
+
+        win.set_compact_mode(False)
+        assert win._compact_mode is False
+        assert win.compact_toggle_button.text() == "Compact"
+
+        # Bot approaches top-right corner -> Window B runs away to bottom_left
+        driver.begin_bot_pointer_action((1750, 120))
+        driver.record_bot_pointer_step((1750, 120))
+        dodged = win.check_and_dodge_bot_cursor((1750, 120))
+        assert dodged is True
+        assert win._current_corner == "bottom_left"
+
+        # Human approaches the new corner (bottom_left) -> Window B stays completely still
+        driver.end_bot_pointer_action((1750, 120))
+        pos_before = (win.x(), win.y())
+        human_center = (win.x() + win.width() // 2, win.y() + win.height() // 2)
+        assert win.check_and_dodge_bot_cursor(human_center) is False
+        assert win._current_corner == "bottom_left"
+        assert (win.x(), win.y()) == pos_before
+
+        win.close()
+        app.processEvents()
+
+    def test_window_b_exclude_from_capture_and_cli_supervised_flag(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        app = QApplication.instance() or QApplication([])
+
+        args = app_main.build_argument_parser().parse_args(["--supervised"])
+        assert args.supervised is True
+
+        safety = SafetyController()
+        driver = MockDryRunDriver(safety=safety)
+        win = DesktopControllerWindow(safety=safety, driver=driver)
+        assert win._apply_exclude_from_capture() is False
+
+        calls: list[tuple[int, int]] = []
+
+        def _fake_set_affinity(hwnd: int, affinity: int) -> int:
+            calls.append((hwnd, affinity))
+            return 1
+
+        monkeypatch.setattr(win, "_is_headless_or_test_mode", lambda: False)
+        monkeypatch.setattr(win, "winId", lambda: 654321)
+        fake_user32 = types.SimpleNamespace(SetWindowDisplayAffinity=_fake_set_affinity)
+        fake_windll = types.SimpleNamespace(user32=fake_user32)
+        monkeypatch.setattr(gui_mod.ctypes, "windll", fake_windll, raising=False)
+        monkeypatch.setattr(gui_mod.os, "name", "nt")
+
+        assert win._apply_exclude_from_capture() is True
+        assert calls == [(654321, 0x11)]
+        win.close()
+        app.processEvents()
+
+    def test_wrapped_cli_args_normalized_and_run_bot_ps1_parses(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("DESKTOP_CONTROLLER_TEST_MODE", "1")
+        _ = QApplication.instance() or QApplication([])
+        rc = app_main.main(
+            [
+                "--headless-check",
+                "--backend",
+                "Antigravity +\n    Ollama",
+                "--supervised",
+                "--task",
+                "open\n    instagram",
+            ]
+        )
+        assert rc == 0
+
+        ps1_path = Path(__file__).resolve().parent.parent / "run_bot.ps1"
+        assert ps1_path.is_file()
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"$errs = $null; "
+                    f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1_path}', [ref]$null, [ref]$errs); "
+                    f"if ($errs.Count -gt 0) {{ $errs | ForEach-Object {{ Write-Error $_.Message }}; exit 1 }}"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_find_matching_browser_window_title_and_live_open_url_reuse(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        visible = [
+            "Window B - Autonomous Windows Desktop Controller (Instagram)",
+            "Instagram Notes - Notepad",
+            "Instagram • Messages — Mozilla Firefox",
+            "YouTube Music — Mozilla Firefox",
+        ]
+        assert (
+            find_matching_browser_window_title("https://www.instagram.com/direct/inbox/", visible)
+            == "Instagram • Messages — Mozilla Firefox"
+        )
+        assert (
+            find_matching_browser_window_title("https://www.instagram.com/", visible)
+            == "Instagram • Messages — Mozilla Firefox"
+        )
+        assert (
+            find_matching_browser_window_title("https://music.youtube.com/search?q=juice+wrld", visible)
+            is None
+        )
+        assert (
+            find_matching_browser_window_title("https://www.instagram.com/reel/123/", visible)
+            is None
+        )
+        assert (
+            find_matching_browser_window_title(
+                "https://www.youtube.com/",
+                ["YouTube Music — Mozilla Firefox"],
+            )
+            is None
+        )
+        assert (
+            find_matching_browser_window_title(
+                "https://www.youtube.com/",
+                ["Home - YouTube — Mozilla Firefox"],
+            )
+            == "Home - YouTube — Mozilla Firefox"
+        )
+        assert (
+            find_matching_browser_window_title(
+                "https://music.youtube.com/",
+                ["YouTube Music — Mozilla Firefox"],
+            )
+            == "YouTube Music — Mozilla Firefox"
+        )
+
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = LiveWindowsDesktopDriver(safety=safety)
+        monkeypatch.setattr(driver, "_poll_hotkeys_and_safety", lambda *a, **k: None)
+        monkeypatch.setattr(
+            driver_mod,
+            "_list_visible_window_titles",
+            lambda: [
+                "Window B - Autonomous Windows Desktop Controller",
+                "Instagram • Messages — Mozilla Firefox",
+            ],
+        )
+        monkeypatch.setattr(
+            driver_mod,
+            "_get_foreground_window_title",
+            lambda: "Window B - Autonomous Windows Desktop Controller",
+        )
+        focus_calls: list[tuple[str, bool]] = []
+        monkeypatch.setattr(
+            driver_mod,
+            "_focus_window_by_title",
+            lambda title, target_pid=None, maximize=False: (
+                focus_calls.append((title, maximize)) or ((0, 0, 1920, 1080), True)
+            ),
+        )
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            driver_mod.subprocess,
+            "Popen",
+            lambda cmd, **kwargs: popen_calls.append(list(cmd)) or types.SimpleNamespace(pid=5555),
+        )
+        monkeypatch.setattr(
+            driver_mod,
+            "_resolve_app_executable",
+            lambda name: r"C:\Program Files\Mozilla Firefox\firefox.exe" if name == "firefox" else name,
+        )
+        monkeypatch.setattr(driver_mod.shutil, "which", lambda _n: "firefox")
+        monkeypatch.setattr(driver_mod.time, "sleep", lambda _s: None)
+
+        reused_meta = driver.open_url("https://www.instagram.com/direct/inbox/")
+        assert reused_meta["reused_existing_window"] is True
+        assert reused_meta["matched_window_title"] == "Instagram • Messages — Mozilla Firefox"
+        assert len(popen_calls) == 0
+        assert len(focus_calls) == 1
+
+        new_tab_meta = driver.open_url("https://music.youtube.com/search?q=juice+wrld")
+        assert new_tab_meta["reused_existing_window"] is False
+        assert len(popen_calls) == 1
+        assert popen_calls[0][1] == "https://music.youtube.com/search?q=juice+wrld"
+
+    def test_plan_interpreter_receives_visible_windows_and_supports_reuse_existing_window(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        prompt = _build_interpreter_prompt(
+            "open instagram",
+            active_window_title="Home — Mozilla Firefox",
+            visible_window_titles=[
+                "Home — Mozilla Firefox",
+                "Instagram • Messages — Mozilla Firefox",
+            ],
+        )
+        assert "Current active window title: Home — Mozilla Firefox" in prompt
+        assert "Instagram • Messages — Mozilla Firefox" in prompt
+        assert "reuse_existing_window" in prompt
+
+        class _VisibleWindowInterpreter(BasePlanInterpreter):
+            name = "VisibleWindowInterpreter"
+
+            def __init__(self) -> None:
+                self.seen_active: list[Optional[str]] = []
+                self.seen_visible: list[Optional[list[str]]] = []
+
+            def is_available(self) -> tuple[bool, str]:
+                return True, "Ready"
+
+            def interpret_task(
+                self,
+                task_text: str,
+                *,
+                failure_context: Optional[str] = None,
+                active_window_title: Optional[str] = None,
+                visible_window_titles: Optional[list[str]] = None,
+            ) -> TaskPlan:
+                self.seen_active.append(active_window_title)
+                self.seen_visible.append(list(visible_window_titles or []))
+                return TaskPlan(
+                    intent_summary="Reuse existing Instagram browser window",
+                    strategy="web_browser",
+                    starting_url=None,
+                    desktop_app=None,
+                    reuse_existing_window=True,
+                    steps=["Reuse existing Instagram window instead of opening a new tab."],
+                    success_criteria="Instagram focused",
+                    source="test",
+                )
+
+        class _ReuseGuardOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_obs: list[ObservationContext] = []
+                self._calls = 0
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_obs.append(obs)
+                idx = self._calls
+                self._calls += 1
+                if idx in (0, 1):
+                    return DesktopAction(
+                        action_type=ActionType.open_url,
+                        url="https://www.instagram.com/direct/inbox/",
+                        description="Open Instagram Inbox",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Reused existing browser window")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        driver.active_window_text = "Untitled - Notepad"
+        driver.visible_window_titles = ["Instagram • Messages — Mozilla Firefox"]
+
+        interpreter = _VisibleWindowInterpreter()
+        planner = _ReuseGuardOllamaPlanner()
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            uia_collector=lambda _vp, _ss: [],
+            plan_interpreter=interpreter,
+        )
+        res = engine.run_task("open instagram")
+        assert res.status == "completed"
+        assert res.retries_used == 1
+        assert interpreter.seen_active == ["Untitled - Notepad"]
+        assert interpreter.seen_visible == [["Instagram • Messages — Mozilla Firefox"]]
+        assert driver.opened_urls == []
+        assert driver.active_window_text == "Instagram • Messages — Mozilla Firefox"
+        assert planner.seen_obs[0].visible_window_titles == ["Instagram • Messages — Mozilla Firefox"]
+        assert "visible_window_titles" in _build_observation_prompt(planner.seen_obs[0])
+        assert planner.seen_obs[2].last_error and "ALREADY open" in planner.seen_obs[2].last_error
+
+    def test_uia_prioritize_ui_elements_keeps_contacts_and_message_box_past_browser_chrome(self) -> None:
+        raw_items: list[dict[str, object]] = []
+        for idx in range(50):
+            cx = 40 + (idx % 25) * 70
+            cy = 20 if idx < 25 else 85
+            raw_items.append(
+                {
+                    "role": "Button" if idx >= 25 else "TabItem",
+                    "name": f"Toolbar Control {idx}",
+                    "rect": [cx - 20, cy - 10, cx + 20, cy + 10],
+                    "center": [cx, cy],
+                }
+            )
+        raw_items.append(
+            {
+                "role": "ListItem",
+                "name": "kkkkkkkkkkkk Active now",
+                "rect": [60, 460, 260, 500],
+                "center": [160, 478],
+            }
+        )
+        raw_items.append(
+            {
+                "role": "Edit",
+                "name": "Message...",
+                "rect": [400, 965, 1600, 1005],
+                "center": [576, 987],
+            }
+        )
+
+        terms = extract_priority_terms("open instagram and text kkkkkkkkkkk hi")
+        result = prioritize_ui_elements(
+            raw_items,
+            (1920, 1080),
+            (0, 0, 1919, 1079),
+            max_elements=40,
+            priority_terms=terms,
+        )
+        assert len(result) == 40
+        assert [el["id"] for el in result] == list(range(1, 41))
+        names = [el["name"] for el in result]
+        assert "kkkkkkkkkkkk Active now" in names
+        assert "Message..." in names
+
+    def test_engine_blocks_duplicate_message_spam_and_resets_zoom_but_allows_failed_focus_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class _SpamAttemptOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_obs: list[ObservationContext] = []
+                self._calls = 0
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_obs.append(obs)
+                idx = self._calls
+                self._calls += 1
+                if idx == 0:
+                    return DesktopAction(
+                        action_type=ActionType.type_text,
+                        text="Hi! I'm your new friend. How are you?",
+                        description="Type initial greeting on Instagram",
+                    )
+                if idx == 1:
+                    return DesktopAction(
+                        action_type=ActionType.press_keys,
+                        keys=["enter"],
+                        description="Send initial greeting",
+                    )
+                if idx == 2:
+                    return DesktopAction(
+                        action_type=ActionType.view_region,
+                        left=200,
+                        top=850,
+                        right=400,
+                        bottom=960,
+                        description="Zoom into message box",
+                    )
+                if idx == 3:
+                    return DesktopAction(
+                        action_type=ActionType.type_text,
+                        text="Hello! I am your new friend. How are you?",
+                        description="Repeat intro message in zoomed view",
+                    )
+                if idx == 4:
+                    assert obs.viewport_mode == "full"
+                    assert obs.last_error and "Duplicate text warning" in obs.last_error
+                    return DesktopAction(
+                        action_type=ActionType.wait,
+                        seconds=6.0,
+                        description="Wait for reply without spamming",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Done waiting")
+
+        ws = tmp_path / "approved_workspace"
+        ws.mkdir()
+        safety = SafetyController()
+        safety.authorize_start()
+        driver = MockDryRunDriver(safety=safety)
+        planner = _SpamAttemptOllamaPlanner()
+        engine = DesktopExecutionEngine(
+            driver=driver,
+            safety=safety,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=planner,
+            uia_collector=lambda _vp, _ss: [],
+            auto_approve_supervised=True,
+        )
+        res = engine.run_task("open instagram and text kkkkkkkkkkk. Introduce yourself")
+        assert res.status == "completed"
+        assert res.retries_used == 1
+        assert "Hello! I am your new friend. How are you?" not in driver.typed_texts
+        assert driver.typed_texts == ["Hi! I'm your new friend. How are you?"]
+
+        # Part B: Live-like driver where Step 0 typing produces NO visible change -> re-typing after click is allowed
+        class _StaticScreenLiveLikeDriver(BaseDesktopDriver):
+            def __init__(self, safety_ctrl: SafetyController) -> None:
+                super().__init__(safety=safety_ctrl)
+                self.typed_texts: list[str] = []
+                self._img = Image.new("RGB", (640, 360), (20, 20, 20))
+
+            def get_screen_size(self) -> tuple[int, int]:
+                return (1920, 1080)
+
+            def get_cursor_position(self) -> tuple[int, int]:
+                return (960, 540)
+
+            def capture_screenshot(self) -> Image.Image:
+                return self._img
+
+            def move_to(self, x: int, y: int, speed_config: Optional[SpeedConfig] = None) -> list[tuple[int, int]]:
+                return [(x, y)]
+
+            def click(
+                self,
+                x: int,
+                y: int,
+                button: str = "left",
+                double: bool = False,
+                speed_config: Optional[SpeedConfig] = None,
+            ) -> None:
+                return None
+
+            def type_text(self, text: str, interval: float = 0.02) -> None:
+                self.typed_texts.append(text)
+
+            def press_keys(self, keys: list[str]) -> None:
+                return None
+
+            def scroll(self, clicks: int) -> None:
+                return None
+
+            def wait(self, seconds: float) -> None:
+                return None
+
+            def launch_app(self, app_name: str, args: Optional[list[str]] = None) -> dict[str, object]:
+                return {}
+
+            def open_url(self, url: str, browser: str = "firefox") -> dict[str, object]:
+                return {}
+
+            def verify_state(
+                self,
+                target_path: Optional[str] = None,
+                expected_text: Optional[str] = None,
+            ) -> tuple[bool, str]:
+                return True, "ok"
+
+        class _RefocusRetryOllamaPlanner(OllamaPlanner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seen_errors: list[Optional[str]] = []
+
+            def plan_next_step(
+                self,
+                obs: ObservationContext,
+                screenshot: Optional[Image.Image] = None,
+            ) -> DesktopAction:
+                self.seen_errors.append(obs.last_error)
+                if obs.step_index == 0:
+                    return DesktopAction(
+                        action_type=ActionType.type_text,
+                        text="hi",
+                        description="Type hi into unfocused box",
+                    )
+                if obs.step_index == 1:
+                    return DesktopAction(
+                        action_type=ActionType.click,
+                        x=300,
+                        y=910,
+                        description="Click input box to focus it",
+                    )
+                if obs.step_index == 2:
+                    return DesktopAction(
+                        action_type=ActionType.type_text,
+                        text="hi",
+                        description="Re-type hi after focusing box",
+                    )
+                return DesktopAction(action_type=ActionType.done, description="Sent hi")
+
+        safety2 = SafetyController()
+        safety2.authorize_start()
+        live_like_driver = _StaticScreenLiveLikeDriver(safety2)
+        refocus_planner = _RefocusRetryOllamaPlanner()
+        engine2 = DesktopExecutionEngine(
+            driver=live_like_driver,
+            safety=safety2,
+            policy=PolicyEngine(approved_workspace=ws),
+            planner=refocus_planner,
+            uia_collector=lambda _vp, _ss: [],
+            auto_approve_supervised=True,
+        )
+        res2 = engine2.run_task("text kkkkkkkkkkk hi")
+        assert res2.status == "completed"
+        assert res2.retries_used == 0
+        assert live_like_driver.typed_texts == ["hi", "hi"]
+        assert not any(err and "Duplicate text warning" in err for err in refocus_planner.seen_errors)

@@ -7,11 +7,22 @@ import math
 import os
 import socket
 import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QBrush,
     QCloseEvent,
@@ -24,9 +35,11 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QShortcut,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
     QGroupBox,
@@ -58,6 +71,7 @@ from controller.emergency import (
     SafetyGateError,
     StopSource,
 )
+from controller.interpreter import resolve_antigravity_executable
 from controller.planners import get_saved_api_key_for_backend, save_api_key_to_dotenv
 from controller.schema import SpeedConfig, SpeedPreset
 
@@ -78,7 +92,20 @@ BACKEND_OPTIONS: tuple[str, ...] = (
     "Gemini API",
     "OpenAI API",
     "Local Ollama",
+    "Antigravity + Ollama",
 )
+
+APPROVAL_MODE_ASK = "Ask Before Risky"
+APPROVAL_MODE_SUPERVISED = "Supervised (Auto-Approve)"
+APPROVAL_MODE_OPTIONS: tuple[str, ...] = (
+    APPROVAL_MODE_ASK,
+    APPROVAL_MODE_SUPERVISED,
+)
+
+COMPACT_WINDOW_EXPANDED_SIZE = (400, 580)
+COMPACT_WINDOW_HUD_SIZE = (320, 118)
+CORNER_MARGIN_PX = 18
+BOT_DODGE_MARGIN_PX = 70
 
 _MOOD_PALETTE: dict[str, tuple[str, str, str]] = {
     "working": ("#38bdf8", "#fbbf24", "#0f172a"),
@@ -254,6 +281,21 @@ class BotCharacterOverlay(QWidget):
         self.face_widget.set_state(mood, phase=self._phase)
         self.adjustSize()
 
+    def _apply_exclude_from_capture(self) -> bool:
+        """Exclude the floating overlay window from screen captures on Windows 10 2004+ / 11."""
+        if os.name != "nt" or self._is_headless_or_test_mode():
+            return False
+        try:
+            wda_exclude_from_capture = 0x00000011
+            return bool(
+                ctypes.windll.user32.SetWindowDisplayAffinity(
+                    int(self.winId()),
+                    wda_exclude_from_capture,
+                )
+            )
+        except Exception:
+            return False
+
     def show_overlay(self) -> None:
         """Display the floating character overlay without stealing focus."""
         self._hide_timer.stop()
@@ -261,6 +303,7 @@ class BotCharacterOverlay(QWidget):
             return
         self._on_anim_tick()
         self.show()
+        self._apply_exclude_from_capture()
         self.raise_()
         if not self._anim_timer.isActive():
             self._anim_timer.start()
@@ -342,6 +385,7 @@ class DesktopControllerWindow(QMainWindow):
         initial_task: str = "",
         auto_start_demo: bool = False,
         initial_backend: str = "Local Demo / Fallback",
+        initial_approval_mode: str = APPROVAL_MODE_ASK,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -356,16 +400,25 @@ class DesktopControllerWindow(QMainWindow):
         self._approval_event = threading.Event()
         self._last_pixmap: Optional[QPixmap] = None
         self._engine_thread: Optional[threading.Thread] = None
+        self._current_corner: str = "top_right"
+        self._compact_mode: bool = False
+        self._dodge_margin: int = BOT_DODGE_MARGIN_PX
+        self._last_dodge_time: float = 0.0
+        self._pos_anim: Optional[QPropertyAnimation] = None
         self.character_overlay = BotCharacterOverlay(driver=self.driver)
 
         self.setWindowTitle("Window B - Autonomous Windows Desktop Controller")
-        self.setGeometry(970, 40, 920, 960)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.setMinimumSize(QSize(300, 108))
 
         self._build_ui()
         self._connect_signals()
         self._setup_shortcuts_and_polling()
 
-        # Apply initial speed, backend, and task
+        self.resize(*COMPACT_WINDOW_EXPANDED_SIZE)
+        self.dock_to_corner("top_right", animate=False)
+
+        # Apply initial speed, backend, approval mode, and task
         if initial_speed in {p.value for p in SpeedPreset}:
             self.speed_combo.setCurrentText(initial_speed)
         else:
@@ -375,6 +428,9 @@ class DesktopControllerWindow(QMainWindow):
         if initial_backend in BACKEND_OPTIONS:
             self.backend_combo.setCurrentText(initial_backend)
         self._on_backend_changed(self.backend_combo.currentText())
+
+        if initial_approval_mode in APPROVAL_MODE_OPTIONS:
+            self.approval_mode_combo.setCurrentText(initial_approval_mode)
 
         if initial_task:
             self.task_input.setText(initial_task)
@@ -390,12 +446,68 @@ class DesktopControllerWindow(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
 
-        # Task & Preset row
-        task_group = QGroupBox("Task Configuration", self)
+        # Always-visible compact corner HUD header
+        self._compact_header = QWidget(self)
+        header_layout = QVBoxLayout(self._compact_header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+
+        top_hud_row = QHBoxLayout()
+        top_hud_row.setSpacing(6)
+        self.bot_avatar = BotFaceWidget(self)
+        self.bot_avatar.setFixedSize(40, 40)
+        top_hud_row.addWidget(self.bot_avatar)
+
+        status_col = QVBoxLayout()
+        status_col.setSpacing(1)
+        self.status_label = QLabel("Idle (Start Authorization Required)", self)
+        self.status_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        self.status_label.setMinimumWidth(0)
+        self.current_action_label = QLabel("Action: None", self)
+        self.current_action_label.setStyleSheet("font-size: 11px; color: #475569;")
+        self.current_action_label.setMinimumWidth(0)
+        status_col.addWidget(self.status_label)
+        status_col.addWidget(self.current_action_label)
+        top_hud_row.addLayout(status_col, stretch=1)
+
+        self.compact_toggle_button = QPushButton("Compact", self)
+        self.compact_toggle_button.setFixedWidth(64)
+        top_hud_row.addWidget(self.compact_toggle_button)
+        header_layout.addLayout(top_hud_row)
+
+        hud_controls_row = QHBoxLayout()
+        hud_controls_row.setSpacing(4)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(16)
+        hud_controls_row.addWidget(self.progress_bar, stretch=1)
+
+        self.pause_button = QPushButton("Pause (Esc)", self)
+        hud_controls_row.addWidget(self.pause_button)
+
+        self.emergency_stop_button = QPushButton("STOP", self)
+        self.emergency_stop_button.setStyleSheet(
+            "background-color: #d91e18; color: white; font-weight: bold; padding: 4px 10px;"
+        )
+        hud_controls_row.addWidget(self.emergency_stop_button)
+        header_layout.addLayout(hud_controls_row)
+
+        root_layout.addWidget(self._compact_header)
+
+        # Expandable details container (hidden in compact running HUD mode)
+        self._details_container = QWidget(self)
+        details_layout = QVBoxLayout(self._details_container)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(6)
+
+        task_group = QGroupBox("Task & Mode", self)
         task_layout = QVBoxLayout(task_group)
+        task_layout.setContentsMargins(6, 6, 6, 6)
+        task_layout.setSpacing(4)
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Preset:", self))
@@ -412,114 +524,98 @@ class DesktopControllerWindow(QMainWindow):
         task_layout.addLayout(input_row)
 
         api_key_row = QHBoxLayout()
-        api_key_row.addWidget(QLabel("API Key:", self))
+        api_key_row.addWidget(QLabel("Key:", self))
         self.api_key_input = QLineEdit(self)
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_input.setPlaceholderText(
-            "Optional API Key (AIza... for Gemini, sk-... for OpenAI, or set in .env)"
-        )
+        self.api_key_input.setPlaceholderText("Optional API Key (AIza..., sk-...)")
         api_key_row.addWidget(self.api_key_input, stretch=1)
         self.save_key_button = QPushButton("Save Key", self)
         api_key_row.addWidget(self.save_key_button)
         task_layout.addLayout(api_key_row)
 
-        # Speed & Backend row
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(QLabel("Speed:", self))
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Planner:", self))
+        self.backend_combo = QComboBox(self)
+        self.backend_combo.addItems(list(BACKEND_OPTIONS))
+        backend_row.addWidget(self.backend_combo, stretch=1)
+        self.backend_status_label = QLabel("Ready (Local Demo)", self)
+        self.backend_status_label.setMinimumWidth(0)
+        backend_row.addWidget(self.backend_status_label)
+        task_layout.addLayout(backend_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Access:", self))
+        self.approval_mode_combo = QComboBox(self)
+        self.approval_mode_combo.addItems(list(APPROVAL_MODE_OPTIONS))
+        mode_row.addWidget(self.approval_mode_combo, stretch=1)
+        task_layout.addLayout(mode_row)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Speed:", self))
         self.speed_combo = QComboBox(self)
         self.speed_combo.addItems([p.value for p in SpeedPreset])
-        controls_row.addWidget(self.speed_combo)
+        speed_row.addWidget(self.speed_combo)
 
-        controls_row.addWidget(QLabel("Move (s):", self))
+        speed_row.addWidget(QLabel("Move:", self))
         self.duration_spin = QDoubleSpinBox(self)
         self.duration_spin.setRange(0.05, 10.0)
         self.duration_spin.setSingleStep(0.05)
         self.duration_spin.setDecimals(2)
-        controls_row.addWidget(self.duration_spin)
+        speed_row.addWidget(self.duration_spin)
 
-        controls_row.addWidget(QLabel("Delay (s):", self))
+        speed_row.addWidget(QLabel("Delay:", self))
         self.delay_spin = QDoubleSpinBox(self)
         self.delay_spin.setRange(0.0, 10.0)
         self.delay_spin.setSingleStep(0.05)
         self.delay_spin.setDecimals(2)
-        controls_row.addWidget(self.delay_spin)
+        speed_row.addWidget(self.delay_spin)
+        task_layout.addLayout(speed_row)
 
-        controls_row.addWidget(QLabel("Planner:", self))
-        self.backend_combo = QComboBox(self)
-        self.backend_combo.addItems(list(BACKEND_OPTIONS))
-        controls_row.addWidget(self.backend_combo)
+        details_layout.addWidget(task_group)
 
-        self.backend_status_label = QLabel("Ready (Local Demo)", self)
-        controls_row.addWidget(self.backend_status_label)
-        task_layout.addLayout(controls_row)
-
-        root_layout.addWidget(task_group)
-
-        # Safety & Control Bar
-        safety_group = QGroupBox(
-            "Safety Gate & Operator Controls (Pause: Esc | E-Stop: F12 / Ctrl+Shift+Esc)",
-            self,
-        )
-        safety_layout = QVBoxLayout(safety_group)
-
+        # Operator controls row
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
         self.start_button = QPushButton("Start / Authorize", self)
-        self.start_button.setStyleSheet("background-color: #1f7a3e; color: white; font-weight: bold; padding: 6px 12px;")
-        self.pause_button = QPushButton("Pause (Esc)", self)
+        self.start_button.setStyleSheet(
+            "background-color: #1f7a3e; color: white; font-weight: bold; padding: 5px 8px;"
+        )
         self.resume_button = QPushButton("Resume", self)
         self.takeover_button = QPushButton("Manual Takeover", self)
-        self.emergency_stop_button = QPushButton("EMERGENCY STOP", self)
-        self.emergency_stop_button.setStyleSheet(
-            "background-color: #d91e18; color: white; font-weight: bold; padding: 6px 14px;"
-        )
         self.reset_stop_button = QPushButton("Reset Stop", self)
 
         for btn in (
             self.start_button,
-            self.pause_button,
             self.resume_button,
             self.takeover_button,
-            self.emergency_stop_button,
             self.reset_stop_button,
         ):
             btn_row.addWidget(btn)
-        safety_layout.addLayout(btn_row)
+        details_layout.addLayout(btn_row)
 
-        status_row = QHBoxLayout()
-        self.bot_avatar = BotFaceWidget(self)
-        self.bot_avatar.setFixedSize(48, 48)
-        self.status_label = QLabel("Idle (Start Authorization Required)", self)
-        self.status_label.setStyleSheet("font-weight: bold;")
-        self.current_action_label = QLabel("Action: None", self)
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        status_row.addWidget(self.bot_avatar)
-        status_row.addWidget(self.status_label, stretch=1)
-        status_row.addWidget(self.current_action_label, stretch=1)
-        status_row.addWidget(self.progress_bar, stretch=1)
-        safety_layout.addLayout(status_row)
-
-        root_layout.addWidget(safety_group)
-
-        # Middle split: Live Screenshot + Approval Panel
+        # Middle split: Live Screenshot + Approval Panel + Action History
         splitter = QSplitter(Qt.Orientation.Vertical, self)
 
         preview_container = QWidget(self)
         preview_layout = QHBoxLayout(preview_container)
         preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
 
-        screenshot_group = QGroupBox("Live Desktop Observation", self)
+        screenshot_group = QGroupBox("Observation", self)
         screenshot_layout = QVBoxLayout(screenshot_group)
+        screenshot_layout.setContentsMargins(4, 4, 4, 4)
         self.screenshot_label = QLabel("No screenshot captured yet", self)
         self.screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.screenshot_label.setMinimumSize(QSize(420, 220))
-        self.screenshot_label.setStyleSheet("background-color: #141821; color: #9aa7b8; border: 1px solid #334;")
+        self.screenshot_label.setMinimumSize(QSize(180, 96))
+        self.screenshot_label.setStyleSheet(
+            "background-color: #141821; color: #9aa7b8; border: 1px solid #334;"
+        )
         screenshot_layout.addWidget(self.screenshot_label)
-        preview_layout.addWidget(screenshot_group, stretch=2)
+        preview_layout.addWidget(screenshot_group, stretch=1)
 
-        self.approval_group = QGroupBox("Policy & Risk Approval Gate", self)
+        self.approval_group = QGroupBox("Approval Gate", self)
         approval_layout = QVBoxLayout(self.approval_group)
+        approval_layout.setContentsMargins(4, 4, 4, 4)
         self.approval_details_label = QLabel("No pending approval request.", self)
         self.approval_details_label.setWordWrap(True)
         approval_layout.addWidget(self.approval_details_label, stretch=1)
@@ -536,9 +632,9 @@ class DesktopControllerWindow(QMainWindow):
 
         splitter.addWidget(preview_container)
 
-        # Action History table
         history_group = QGroupBox("Action History", self)
         history_layout = QVBoxLayout(history_group)
+        history_layout.setContentsMargins(4, 4, 4, 4)
         self.history_table = QTableWidget(0, 4, self)
         self.history_table.setHorizontalHeaderLabels(["Time", "Action", "Status", "Detail"])
         self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -550,7 +646,8 @@ class DesktopControllerWindow(QMainWindow):
         history_layout.addWidget(self.history_table)
         splitter.addWidget(history_group)
 
-        root_layout.addWidget(splitter, stretch=1)
+        details_layout.addWidget(splitter, stretch=1)
+        root_layout.addWidget(self._details_container, stretch=1)
 
     def _connect_signals(self) -> None:
         self.preset_task_combo.currentTextChanged.connect(self._on_preset_task_changed)
@@ -569,6 +666,7 @@ class DesktopControllerWindow(QMainWindow):
         self.reset_stop_button.clicked.connect(self.on_reset_stop_clicked)
         self.approve_button.clicked.connect(self.on_approve_clicked)
         self.deny_button.clicked.connect(self.on_deny_clicked)
+        self.compact_toggle_button.clicked.connect(self._on_compact_toggle_clicked)
         self._history_signal.connect(self.append_history_row)
         self._progress_signal.connect(self.set_progress)
         self._screenshot_signal.connect(self.update_screenshot)
@@ -585,12 +683,192 @@ class DesktopControllerWindow(QMainWindow):
         self.esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.esc_shortcut.activated.connect(self._on_esc_shortcut)
 
+        self.approve_return_shortcut = QShortcut(QKeySequence("Return"), self)
+        self.approve_return_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.approve_return_shortcut.activated.connect(self._on_approve_shortcut)
+
+        self.approve_enter_shortcut = QShortcut(QKeySequence("Enter"), self)
+        self.approve_enter_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.approve_enter_shortcut.activated.connect(self._on_approve_shortcut)
+
+        self.deny_delete_shortcut = QShortcut(QKeySequence("Delete"), self)
+        self.deny_delete_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.deny_delete_shortcut.activated.connect(self._on_deny_shortcut)
+
         self._poll_timer: Optional[QTimer] = None
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
             self._poll_timer = QTimer(self)
-            self._poll_timer.setInterval(80)
+            self._poll_timer.setInterval(50)
             self._poll_timer.timeout.connect(self._poll_global_safety)
             self._poll_timer.start()
+
+    @staticmethod
+    def _is_headless_or_test_mode() -> bool:
+        return (
+            os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1"
+            or os.environ.get("QT_QPA_PLATFORM") == "offscreen"
+        )
+
+    def _apply_exclude_from_capture(self) -> bool:
+        """Exclude Window B from desktop screenshots on Windows 10 2004+ / 11."""
+        if os.name != "nt" or self._is_headless_or_test_mode():
+            return False
+        try:
+            wda_exclude_from_capture = 0x00000011
+            return bool(
+                ctypes.windll.user32.SetWindowDisplayAffinity(
+                    int(self.winId()),
+                    wda_exclude_from_capture,
+                )
+            )
+        except Exception:
+            return False
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._apply_exclude_from_capture()
+
+    def is_supervised_mode(self) -> bool:
+        """Return True when Supervised (Auto-Approve) mode is active."""
+        return self.approval_mode_combo.currentText() == APPROVAL_MODE_SUPERVISED
+
+    def _on_compact_toggle_clicked(self) -> None:
+        self.set_compact_mode(not self._compact_mode)
+
+    def set_compact_mode(self, compact: bool) -> None:
+        """Switch Window B between the compact corner HUD and expanded panel."""
+        self._compact_mode = bool(compact)
+        self._details_container.setVisible(not self._compact_mode)
+        self.compact_toggle_button.setText("Expand" if self._compact_mode else "Compact")
+        w, h = COMPACT_WINDOW_HUD_SIZE if self._compact_mode else COMPACT_WINDOW_EXPANDED_SIZE
+        self.resize(w, h)
+        self.dock_to_corner(self._current_corner, animate=False)
+
+    def _available_screen_rect(self) -> tuple[int, int, int, int]:
+        if not self._is_headless_or_test_mode():
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                if avail.width() > 0 and avail.height() > 0:
+                    return (
+                        int(avail.x()),
+                        int(avail.y()),
+                        int(avail.width()),
+                        int(avail.height()),
+                    )
+        sw, sh = self.driver.get_screen_size()
+        return (0, 0, max(1, int(sw)), max(1, int(sh)))
+
+    def compute_corner_positions(
+        self,
+        screen_rect: Optional[tuple[int, int, int, int]] = None,
+    ) -> dict[str, tuple[int, int]]:
+        """Compute anchored (x, y) positions for all 4 screen corners."""
+        sx, sy, sw, sh = screen_rect or self._available_screen_rect()
+        if self.width() > 0 and self.height() > 0:
+            w, h = self.width(), self.height()
+        else:
+            w, h = COMPACT_WINDOW_HUD_SIZE if self._compact_mode else COMPACT_WINDOW_EXPANDED_SIZE
+        m = CORNER_MARGIN_PX
+        left_x = sx + m
+        right_x = max(left_x, sx + sw - w - m)
+        top_y = sy + m
+        bottom_y = max(top_y, sy + sh - h - m)
+        return {
+            "top_right": (right_x, top_y),
+            "top_left": (left_x, top_y),
+            "bottom_left": (left_x, bottom_y),
+            "bottom_right": (right_x, bottom_y),
+        }
+
+    def dock_to_corner(self, corner: str, animate: bool = True) -> tuple[int, int]:
+        """Dock Window B to a named screen corner, optionally with smooth easing."""
+        corners = self.compute_corner_positions()
+        resolved = corner if corner in corners else "top_right"
+        tx, ty = corners[resolved]
+        self._current_corner = resolved
+
+        if self._is_headless_or_test_mode() or not animate:
+            if self._pos_anim is not None:
+                self._pos_anim.stop()
+            self.move(tx, ty)
+        else:
+            if self._pos_anim is not None:
+                self._pos_anim.stop()
+            anim = QPropertyAnimation(self, b"pos", self)
+            anim.setDuration(160)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(self.pos())
+            anim.setEndValue(QPoint(tx, ty))
+            self._pos_anim = anim
+            anim.start()
+        return tx, ty
+
+    def check_and_dodge_bot_cursor(
+        self,
+        cursor_pos: Optional[tuple[int, int]] = None,
+        bot_target: Optional[tuple[int, int]] = None,
+    ) -> bool:
+        """Move Window B to the farthest safe corner ONLY when the bot cursor approaches it."""
+        if cursor_pos is None:
+            cursor_pos = self.driver.get_cursor_position()
+        if bot_target is None:
+            bot_target = self.driver.get_bot_target_position()
+        if not self.driver.is_bot_driving_cursor(cursor_pos):
+            return False
+
+        wx, wy = self.x(), self.y()
+        ww, wh = max(1, self.width()), max(1, self.height())
+        m = self._dodge_margin
+
+        def _in_zone(pt: tuple[int, int], rx: int, ry: int) -> bool:
+            return (rx - m) <= pt[0] <= (rx + ww + m) and (ry - m) <= pt[1] <= (ry + wh + m)
+
+        threats = [cursor_pos]
+        if bot_target is not None:
+            threats.append(bot_target)
+
+        if not any(_in_zone(pt, wx, wy) for pt in threats):
+            return False
+
+        now = time.monotonic()
+        target_inside_current = bot_target is not None and _in_zone(bot_target, wx, wy)
+        if not self._is_headless_or_test_mode() and not target_inside_current:
+            if (now - self._last_dodge_time) < 0.25:
+                return False
+
+        corners = self.compute_corner_positions()
+        best_corner: Optional[str] = None
+        best_score: Optional[tuple[int, float]] = None
+        for name, (cx, cy) in corners.items():
+            if name == self._current_corner:
+                continue
+            clear = 0 if any(_in_zone(pt, cx, cy) for pt in threats) else 1
+            center_x = cx + ww / 2.0
+            center_y = cy + wh / 2.0
+            min_dist_sq = min(
+                (center_x - pt[0]) ** 2 + (center_y - pt[1]) ** 2
+                for pt in threats
+            )
+            score = (clear, min_dist_sq)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_corner = name
+
+        if best_corner is None:
+            return False
+
+        self.dock_to_corner(best_corner, animate=not self._is_headless_or_test_mode())
+        self._last_dodge_time = now
+        return True
+
+    def _on_approve_shortcut(self) -> None:
+        if self.pending_approval and self.approve_button.isEnabled():
+            self.on_approve_clicked()
+
+    def _on_deny_shortcut(self) -> None:
+        if self.pending_approval and self.deny_button.isEnabled():
+            self.on_deny_clicked()
 
     def _on_preset_task_changed(self, text: str) -> None:
         if text and text != "Custom Task":
@@ -624,7 +902,7 @@ class DesktopControllerWindow(QMainWindow):
             self.api_key_input.setText(saved)
             self.api_key_input.blockSignals(False)
         elif (
-            backend in {"Local Demo / Fallback", "Local Ollama"}
+            backend in {"Local Demo / Fallback", "Local Ollama", "Antigravity + Ollama"}
             or (backend == "Gemini API" and current.startswith("sk-"))
             or (backend == "OpenAI API" and current.startswith(("AIza", "AQ.")))
         ):
@@ -669,7 +947,29 @@ class DesktopControllerWindow(QMainWindow):
                 self.backend_status_label.setText("Ollama Check Skipped (Test Mode)")
             else:
                 reachable = self._check_ollama_reachable()
-                self.backend_status_label.setText("Ollama Ready (11434)" if reachable else "Ollama Unreachable")
+                if reachable:
+                    has_agy = bool(resolve_antigravity_executable())
+                    self.backend_status_label.setText(
+                        "Ollama Ready (11434) + Antigravity Brain"
+                        if has_agy
+                        else "Ollama Ready (11434)"
+                    )
+                else:
+                    self.backend_status_label.setText("Ollama Unreachable")
+        elif backend == "Antigravity + Ollama":
+            if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") == "1":
+                self.backend_status_label.setText("Antigravity + Ollama (Test Mode)")
+            else:
+                has_agy = bool(resolve_antigravity_executable())
+                reachable = self._check_ollama_reachable()
+                if has_agy and reachable:
+                    self.backend_status_label.setText("Antigravity CLI + Ollama Ready")
+                elif not has_agy and not reachable:
+                    self.backend_status_label.setText("Missing Antigravity CLI & Ollama")
+                elif not has_agy:
+                    self.backend_status_label.setText("Missing Antigravity CLI (Ollama Ready)")
+                else:
+                    self.backend_status_label.setText("Antigravity CLI Ready (Ollama Unreachable)")
         else:
             self.backend_status_label.setText("Unknown Backend")
 
@@ -774,6 +1074,10 @@ class DesktopControllerWindow(QMainWindow):
         )
         self.approve_button.setEnabled(True)
         self.deny_button.setEnabled(True)
+        if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            if self._compact_mode:
+                self.set_compact_mode(False)
+            self.raise_()
         self.status_label.setText("Awaiting User Approval")
         self._update_bot_character("approval", "Awaiting Approval")
         self.append_history_row("request_approval", "pending", f"[{risk_category}] {reason}")
@@ -846,6 +1150,8 @@ class DesktopControllerWindow(QMainWindow):
                 w, h = self.driver.get_screen_size()
                 if self.safety.check_corner_failsafe(x, y, w, h):
                     self._after_emergency_stop(StopSource.corner_failsafe.value)
+                    return
+                self.check_and_dodge_bot_cursor(cursor_pos=(x, y))
         except Exception:
             pass
 
@@ -872,6 +1178,7 @@ class DesktopControllerWindow(QMainWindow):
         self._update_bot_character("stopped", "EMERGENCY STOP")
         self.character_overlay.hide_after_delay(1500)
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.set_compact_mode(False)
             self.showNormal()
         self.append_history_row("emergency_stop", "halted", f"Source: {source}")
         self.emergency_stopped.emit(source)
@@ -899,7 +1206,7 @@ class DesktopControllerWindow(QMainWindow):
 
         # Optional M3 engine integration (only active once controller.engine exists)
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
-            self.showMinimized()
+            self.set_compact_mode(True)
             self._try_launch_engine(task_text, backend_name)
 
     def _on_status_signal(self, status_text: str) -> None:
@@ -917,6 +1224,7 @@ class DesktopControllerWindow(QMainWindow):
         self._update_bot_character(mood, badge_msg)
         self.character_overlay.hide_after_delay(2000)
         if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.set_compact_mode(False)
             self.showNormal()
 
     def _try_launch_engine(self, task_text: str, backend_name: str) -> None:
@@ -930,30 +1238,48 @@ class DesktopControllerWindow(QMainWindow):
             return
 
         def _on_progress(current: int, total: int, action_text: str) -> None:
-            self._progress_signal.emit(current, total, action_text)
+            try:
+                self._progress_signal.emit(current, total, action_text)
+            except RuntimeError:
+                pass
 
         def _on_screenshot(image: Image.Image) -> None:
-            self._screenshot_signal.emit(image)
+            try:
+                self._screenshot_signal.emit(image)
+            except RuntimeError:
+                pass
 
         def _on_history(action_type: str, status: str, detail: str) -> None:
-            self._history_signal.emit(action_type, status, detail)
+            try:
+                self._history_signal.emit(action_type, status, detail)
+            except RuntimeError:
+                pass
 
         def _on_approval(action: DesktopAction, decision: PolicyDecision) -> bool:
-            self._approval_event.clear()
-            self._approval_signal.emit(
-                decision.reason,
-                decision.risk_category,
-                action.description,
-            )
+            try:
+                if self.is_supervised_mode():
+                    return True
+                self._approval_event.clear()
+                self._approval_signal.emit(
+                    decision.reason,
+                    decision.risk_category,
+                    action.description,
+                )
+            except RuntimeError:
+                return False
             return self.wait_for_approval_decision()
 
         def _on_completion(result: ExecutionResult) -> None:
-            self._completion_signal.emit(
-                result.status,
-                result.summary or result.error or "",
-            )
+            try:
+                self._completion_signal.emit(
+                    result.status,
+                    result.summary or result.error or "",
+                )
+            except RuntimeError:
+                pass
 
         runtime_api_key = self.api_key_input.text().strip() or None
+        supervised_initial = self.is_supervised_mode()
 
         def _worker() -> None:
             try:
@@ -968,11 +1294,15 @@ class DesktopControllerWindow(QMainWindow):
                     screenshot_callback=_on_screenshot,
                     history_callback=_on_history,
                     completion_callback=_on_completion,
+                    auto_approve_supervised=supervised_initial,
                 )
                 engine.run_task(task_text)
             except Exception as exc:
-                self._history_signal.emit("engine", "error", str(exc))
-                self._status_signal.emit(f"Engine Error: {exc}")
+                try:
+                    self._history_signal.emit("engine", "error", str(exc))
+                    self._status_signal.emit(f"Engine Error: {exc}")
+                except RuntimeError:
+                    pass
 
         self._engine_thread = threading.Thread(target=_worker, daemon=True)
         self._engine_thread.start()
@@ -1033,6 +1363,9 @@ class DesktopControllerWindow(QMainWindow):
         self._update_bot_character("working", "Approved - Continuing...")
         self.append_history_row("approval", "approved", self.approval_info.get("reason", ""))
         self.approval_resolved.emit(True)
+        if os.environ.get("DESKTOP_CONTROLLER_TEST_MODE") != "1":
+            self.set_compact_mode(True)
+            self.driver.restore_last_app_focus()
 
     def on_deny_clicked(self) -> None:
         self.approval_decision = False
@@ -1050,6 +1383,12 @@ class DesktopControllerWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._poll_timer is not None:
             self._poll_timer.stop()
+        if (
+            self._engine_thread is not None
+            and self._engine_thread.is_alive()
+            and not self.safety.emergency_stopped
+        ):
+            self.safety.trigger_emergency_stop(StopSource.gui_button.value)
         self.character_overlay.close()
         self._approval_event.set()
         super().closeEvent(event)
